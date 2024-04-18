@@ -65,6 +65,7 @@ import org.apache.accumulo.core.summary.Gatherer;
 import org.apache.accumulo.core.summary.SummarizerFactory;
 import org.apache.accumulo.core.summary.SummaryCollection;
 import org.apache.accumulo.core.summary.SummaryReader;
+import org.apache.accumulo.core.util.compaction.DeprecatedCompactionKind;
 import org.apache.accumulo.server.ServiceEnvironmentImpl;
 import org.apache.accumulo.server.compaction.CompactionStats;
 import org.apache.accumulo.server.compaction.FileCompactor;
@@ -81,7 +82,8 @@ import com.google.common.collect.Collections2;
 
 public class CompactableUtils {
 
-  static Map<String,String> computeOverrides(Tablet tablet, Set<CompactableFile> files) {
+  static Map<String,String> computeOverrides(Tablet tablet, Set<CompactableFile> inputFiles,
+      Set<StoredTabletFile> selectedFiles, CompactionKind kind) {
     var tconf = tablet.getTableConfiguration();
 
     var configurorClass = tconf.get(Property.TABLE_COMPACTION_CONFIGURER);
@@ -91,11 +93,12 @@ public class CompactableUtils {
 
     var opts = tconf.getAllPropertiesWithPrefixStripped(Property.TABLE_COMPACTION_CONFIGURER_OPTS);
 
-    return computeOverrides(tablet, files, new PluginConfig(configurorClass, opts));
+    return computeOverrides(tablet, inputFiles, selectedFiles,
+        new PluginConfig(configurorClass, opts), kind);
   }
 
-  static Map<String,String> computeOverrides(Tablet tablet, Set<CompactableFile> files,
-      PluginConfig cfg) {
+  static Map<String,String> computeOverrides(Tablet tablet, Set<CompactableFile> inputFiles,
+      Set<StoredTabletFile> selectedFiles, PluginConfig cfg, CompactionKind kind) {
     CompactionConfigurer configurer = CompactableUtils.newInstance(tablet.getTableConfiguration(),
         cfg.getClassName(), CompactionConfigurer.class);
 
@@ -121,7 +124,18 @@ public class CompactableUtils {
     var overrides = configurer.override(new CompactionConfigurer.InputParameters() {
       @Override
       public Collection<CompactableFile> getInputFiles() {
-        return files;
+        return inputFiles;
+      }
+
+      @Override
+      public Set<CompactableFile> getSelectedFiles() {
+        if (kind == CompactionKind.USER || kind == DeprecatedCompactionKind.SELECTOR) {
+          var dataFileSizes = tablet.getDatafileManager().getDatafileSizes();
+          return selectedFiles.stream().map(f -> new CompactableFileImpl(f, dataFileSizes.get(f)))
+              .collect(Collectors.toSet());
+        } else { // kind == CompactionKind.SYSTEM
+          return Collections.emptySet();
+        }
       }
 
       @Override
@@ -266,7 +280,8 @@ public class CompactableUtils {
     }
 
     @Override
-    public Map<String,String> getConfigOverrides(Set<CompactableFile> files) {
+    public Map<String,String> getConfigOverrides(Set<CompactableFile> inputFiles,
+        Set<StoredTabletFile> selectedFiles, CompactionKind kind) {
       return null;
     }
   }
@@ -306,28 +321,34 @@ public class CompactableUtils {
     }
 
     @Override
-    public Map<String,String> getConfigOverrides(Set<CompactableFile> files) {
+    public Map<String,String> getConfigOverrides(Set<CompactableFile> inputFiles,
+        Set<StoredTabletFile> selectedFiles, CompactionKind kind) {
       if (!UserCompactionUtils.isDefault(compactionConfig.getConfigurer())) {
-        return computeOverrides(tablet, files, compactionConfig.getConfigurer());
+        return computeOverrides(tablet, inputFiles, selectedFiles, compactionConfig.getConfigurer(),
+            kind);
       }
 
       return null;
     }
   }
 
+  @SuppressWarnings("deprecation")
+  private static final Property SELECTOR_PROP = Property.TABLE_COMPACTION_SELECTOR;
+  @SuppressWarnings("deprecation")
+  private static final Property SELECTOR_OPTS_PROP = Property.TABLE_COMPACTION_SELECTOR_OPTS;
+
   public static CompactionHelper getHelper(CompactionKind kind, Tablet tablet, Long compactionId,
       CompactionConfig compactionConfig) {
     if (kind == CompactionKind.USER) {
       return new UserCompactionHelper(compactionConfig, tablet, compactionId);
-    } else if (kind == CompactionKind.SELECTOR) {
+    } else if (kind == DeprecatedCompactionKind.SELECTOR) {
       var tconf = tablet.getTableConfiguration();
-      var selectorClassName = tconf.get(Property.TABLE_COMPACTION_SELECTOR);
+      var selectorClassName = tconf.get(SELECTOR_PROP);
 
       PluginConfig cselCfg = null;
 
       if (selectorClassName != null && !selectorClassName.isBlank()) {
-        var opts =
-            tconf.getAllPropertiesWithPrefixStripped(Property.TABLE_COMPACTION_SELECTOR_OPTS);
+        var opts = tconf.getAllPropertiesWithPrefixStripped(SELECTOR_OPTS_PROP);
         cselCfg = new PluginConfig(selectorClassName, opts);
       }
 
@@ -340,16 +361,17 @@ public class CompactableUtils {
   }
 
   public static Map<String,String> getOverrides(CompactionKind kind, Tablet tablet,
-      CompactionHelper driver, Set<CompactableFile> files) {
+      CompactionHelper driver, Set<CompactableFile> inputFiles,
+      Set<StoredTabletFile> selectedFiles) {
 
     Map<String,String> overrides = null;
 
-    if (kind == CompactionKind.USER || kind == CompactionKind.SELECTOR) {
-      overrides = driver.getConfigOverrides(files);
+    if (kind == CompactionKind.USER || kind == DeprecatedCompactionKind.SELECTOR) {
+      overrides = driver.getConfigOverrides(inputFiles, selectedFiles, kind);
     }
 
     if (overrides == null) {
-      overrides = computeOverrides(tablet, files);
+      overrides = computeOverrides(tablet, inputFiles, selectedFiles, kind);
     }
 
     if (overrides == null) {
@@ -380,8 +402,9 @@ public class CompactableUtils {
       throws IOException, CompactionCanceledException {
     TableConfiguration tableConf = tablet.getTableConfiguration();
 
-    AccumuloConfiguration compactionConfig = getCompactionConfig(tableConf,
-        getOverrides(job.getKind(), tablet, cInfo.localHelper, job.getFiles()));
+    AccumuloConfiguration compactionConfig =
+        getCompactionConfig(tableConf, getOverrides(job.getKind(), tablet, cInfo.localHelper,
+            job.getFiles(), cInfo.selectedFiles));
 
     FileCompactor compactor = new FileCompactor(tablet.getContext(), tablet.getExtent(),
         compactFiles, tmpFileName, cInfo.propagateDeletes, cenv, cInfo.iters, compactionConfig,

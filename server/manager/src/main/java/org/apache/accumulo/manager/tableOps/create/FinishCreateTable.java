@@ -19,9 +19,11 @@
 package org.apache.accumulo.manager.tableOps.create;
 
 import java.io.IOException;
+import java.util.EnumSet;
 
 import org.apache.accumulo.core.client.admin.InitialTableState;
 import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.zookeeper.DistributedReadWriteLock.LockType;
 import org.apache.accumulo.core.manager.state.tables.TableState;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.ManagerRepo;
@@ -50,17 +52,18 @@ class FinishCreateTable extends ManagerRepo {
 
   @Override
   public Repo<Manager> call(long tid, Manager env) throws Exception {
+    final EnumSet<TableState> expectedCurrStates = EnumSet.of(TableState.NEW);
 
     if (tableInfo.getInitialTableState() == InitialTableState.OFFLINE) {
       env.getContext().getTableManager().transitionTableState(tableInfo.getTableId(),
-          TableState.OFFLINE);
+          TableState.OFFLINE, expectedCurrStates);
     } else {
       env.getContext().getTableManager().transitionTableState(tableInfo.getTableId(),
-          TableState.ONLINE);
+          TableState.ONLINE, expectedCurrStates);
     }
 
-    Utils.unreserveNamespace(env, tableInfo.getNamespaceId(), tid, false);
-    Utils.unreserveTable(env, tableInfo.getTableId(), tid, true);
+    Utils.unreserveNamespace(env, tableInfo.getNamespaceId(), tid, LockType.READ);
+    Utils.unreserveTable(env, tableInfo.getTableId(), tid, LockType.WRITE);
 
     env.getEventCoordinator().event("Created table %s ", tableInfo.getTableName());
 

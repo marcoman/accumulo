@@ -30,6 +30,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.net.UnknownHostException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -92,8 +93,7 @@ import org.apache.accumulo.core.manager.thrift.ManagerMonitorInfo;
 import org.apache.accumulo.core.manager.thrift.ManagerState;
 import org.apache.accumulo.core.manager.thrift.TableInfo;
 import org.apache.accumulo.core.manager.thrift.TabletServerStatus;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.TServerInstance;
 import org.apache.accumulo.core.metadata.TabletLocationState;
 import org.apache.accumulo.core.metadata.schema.Ample.DataLevel;
@@ -112,6 +112,7 @@ import org.apache.accumulo.core.util.Halt;
 import org.apache.accumulo.core.util.Retry;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.core.util.threads.Threads;
+import org.apache.accumulo.core.util.time.NanoTime;
 import org.apache.accumulo.manager.metrics.ManagerMetrics;
 import org.apache.accumulo.manager.recovery.RecoveryManager;
 import org.apache.accumulo.manager.state.TableCounts;
@@ -156,6 +157,7 @@ import org.apache.zookeeper.Watcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.collect.Comparators;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.util.concurrent.RateLimiter;
 import com.google.common.util.concurrent.Uninterruptibles;
@@ -345,8 +347,8 @@ public class Manager extends AbstractServer
   }
 
   private int nonMetaDataTabletsAssignedOrHosted() {
-    return totalAssignedOrHosted() - assignedOrHosted(MetadataTable.ID)
-        - assignedOrHosted(RootTable.ID);
+    return totalAssignedOrHosted() - assignedOrHosted(AccumuloTable.METADATA.tableId())
+        - assignedOrHosted(AccumuloTable.ROOT.tableId());
   }
 
   private int notHosted() {
@@ -380,14 +382,14 @@ public class Manager extends AbstractServer
       case SAFE_MODE:
         // Count offline tablets for the metadata table
         for (TabletGroupWatcher watcher : watchers) {
-          TableCounts counts = watcher.getStats(MetadataTable.ID);
+          TableCounts counts = watcher.getStats(AccumuloTable.METADATA.tableId());
           result += counts.unassigned() + counts.suspended();
         }
         break;
       case UNLOAD_METADATA_TABLETS:
       case UNLOAD_ROOT_TABLET:
         for (TabletGroupWatcher watcher : watchers) {
-          TableCounts counts = watcher.getStats(MetadataTable.ID);
+          TableCounts counts = watcher.getStats(AccumuloTable.METADATA.tableId());
           result += counts.unassigned() + counts.suspended();
         }
         break;
@@ -598,7 +600,6 @@ public class Manager extends AbstractServer
         }
         return TabletGoalState.UNASSIGNED;
       case UNLOAD_ROOT_TABLET:
-        return TabletGoalState.UNASSIGNED;
       case STOP:
         return TabletGoalState.UNASSIGNED;
       default:
@@ -650,7 +651,14 @@ public class Manager extends AbstractServer
             case STARTED:
               return TabletGoalState.HOSTED;
             case WAITING_FOR_OFFLINE:
+              // If we have walogs we need to be HOSTED to recover
+              if (!tls.walogs.isEmpty()) {
+                return TabletGoalState.HOSTED;
+              } else {
+                return TabletGoalState.UNASSIGNED;
+              }
             case MERGING:
+            case MERGED:
               return TabletGoalState.UNASSIGNED;
           }
         } else {
@@ -695,7 +703,8 @@ public class Manager extends AbstractServer
      */
     private void cleanupNonexistentMigrations(final AccumuloClient accumuloClient)
         throws TableNotFoundException {
-      Scanner scanner = accumuloClient.createScanner(MetadataTable.NAME, Authorizations.EMPTY);
+      Scanner scanner =
+          accumuloClient.createScanner(AccumuloTable.METADATA.tableName(), Authorizations.EMPTY);
       TabletColumnFamily.PREV_ROW_COLUMN.fetch(scanner);
       Set<KeyExtent> found = new HashSet<>();
       for (Entry<Key,Value> entry : scanner) {
@@ -752,7 +761,7 @@ public class Manager extends AbstractServer
     public void run() {
       EventCoordinator.Listener eventListener = nextEvent.getListener();
       while (stillManager()) {
-        long wait = DEFAULT_WAIT_FOR_WATCHER;
+        long wait;
         try {
           switch (getManagerGoalState()) {
             case NORMAL:
@@ -781,7 +790,7 @@ public class Manager extends AbstractServer
                 }
                   break;
                 case UNLOAD_METADATA_TABLETS: {
-                  int count = assignedOrHosted(MetadataTable.ID);
+                  int count = assignedOrHosted(AccumuloTable.METADATA.tableId());
                   log.debug(
                       String.format("There are %d metadata tablets assigned or hosted", count));
                   if (count == 0 && goodStats()) {
@@ -790,12 +799,12 @@ public class Manager extends AbstractServer
                 }
                   break;
                 case UNLOAD_ROOT_TABLET:
-                  int count = assignedOrHosted(MetadataTable.ID);
+                  int count = assignedOrHosted(AccumuloTable.METADATA.tableId());
                   if (count > 0 && goodStats()) {
                     log.debug(String.format("%d metadata tablets online", count));
                     setManagerState(ManagerState.UNLOAD_ROOT_TABLET);
                   }
-                  int root_count = assignedOrHosted(RootTable.ID);
+                  int root_count = assignedOrHosted(AccumuloTable.ROOT.tableId());
                   if (root_count > 0 && goodStats()) {
                     log.debug("The root tablet is still assigned or hosted");
                   }
@@ -1015,11 +1024,12 @@ public class Manager extends AbstractServer
       }));
     }
     // wait at least 10 seconds
-    final long nanosToWait = Math.max(SECONDS.toNanos(10), MILLISECONDS.toNanos(rpcTimeout) / 3);
-    final long startTime = System.nanoTime();
+    final Duration timeToWait =
+        Comparators.max(Duration.ofSeconds(10), Duration.ofMillis(rpcTimeout / 3));
+    final NanoTime startTime = NanoTime.now();
     // Wait for all tasks to complete
     while (!tasks.isEmpty()) {
-      boolean cancel = ((System.nanoTime() - startTime) > nanosToWait);
+      boolean cancel = (startTime.elapsed().compareTo(timeToWait) > 0);
       Iterator<Future<?>> iter = tasks.iterator();
       while (iter.hasNext()) {
         Future<?> f = iter.next();
@@ -1096,7 +1106,7 @@ public class Manager extends AbstractServer
 
     try {
       MetricsUtil.initializeMetrics(getContext().getConfiguration(), this.applicationName,
-          sa.getAddress());
+          sa.getAddress(), getContext().getInstanceName());
       ManagerMetrics mm = new ManagerMetrics(getConfiguration(), this);
       MetricsUtil.initializeProducers(this, mm);
     } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
@@ -1338,9 +1348,10 @@ public class Manager extends AbstractServer
       waitIncrement = 5;
     }
 
-    Retry tserverRetry = Retry.builder().maxRetries(retries).retryAfter(initialWait, SECONDS)
-        .incrementBy(waitIncrement, SECONDS).maxWait(maxWaitPeriod, SECONDS).backOffFactor(1)
-        .logInterval(30, SECONDS).createRetry();
+    Retry tserverRetry = Retry.builder().maxRetries(retries)
+        .retryAfter(Duration.ofSeconds(initialWait)).incrementBy(Duration.ofSeconds(waitIncrement))
+        .maxWait(Duration.ofSeconds(maxWaitPeriod)).backOffFactor(1)
+        .logInterval(Duration.ofSeconds(30)).createRetry();
 
     log.info("Checking for tserver availability - need to reach {} servers. Have {}",
         minTserverCount, tserverSet.size());
@@ -1425,7 +1436,7 @@ public class Manager extends AbstractServer
       }
 
       if (acquiredLock) {
-        Halt.halt("Zoolock in unexpected state FAL " + acquiredLock + " " + failedToAcquireLock,
+        Halt.halt("Zoolock in unexpected state acquiredLock true with FAL " + failedToAcquireLock,
             -1);
       }
 
@@ -1437,7 +1448,9 @@ public class Manager extends AbstractServer
       while (!acquiredLock && !failedToAcquireLock) {
         try {
           wait();
-        } catch (InterruptedException e) {}
+        } catch (InterruptedException e) {
+          // empty
+        }
       }
     }
   }
@@ -1574,10 +1587,10 @@ public class Manager extends AbstractServer
     Set<TableId> result = new HashSet<>();
     if (getManagerState() != ManagerState.NORMAL) {
       if (getManagerState() != ManagerState.UNLOAD_METADATA_TABLETS) {
-        result.add(MetadataTable.ID);
+        result.add(AccumuloTable.METADATA.tableId());
       }
       if (getManagerState() != ManagerState.UNLOAD_ROOT_TABLET) {
-        result.add(RootTable.ID);
+        result.add(AccumuloTable.ROOT.tableId());
       }
       return result;
     }
@@ -1586,7 +1599,7 @@ public class Manager extends AbstractServer
 
     for (TableId tableId : context.getTableIdToNameMap().keySet()) {
       TableState state = manager.getTableState(tableId);
-      if ((state != null) && (state == TableState.ONLINE)) {
+      if (state == TableState.ONLINE) {
         result.add(tableId);
       }
     }

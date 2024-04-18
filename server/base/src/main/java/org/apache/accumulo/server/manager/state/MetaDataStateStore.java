@@ -23,7 +23,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.accumulo.core.clientImpl.ClientContext;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.TServerInstance;
 import org.apache.accumulo.core.metadata.TabletLocationState;
 import org.apache.accumulo.core.metadata.schema.Ample;
@@ -53,7 +53,7 @@ class MetaDataStateStore implements TabletStateStore {
   }
 
   MetaDataStateStore(DataLevel level, ClientContext context, CurrentState state) {
-    this(level, context, state, MetadataTable.NAME);
+    this(level, context, state, AccumuloTable.METADATA.tableName());
   }
 
   @Override
@@ -123,7 +123,7 @@ class MetaDataStateStore implements TabletStateStore {
             List<Path> logs = logsForDeadServers.get(tls.current.getServerInstance());
             if (logs != null) {
               for (Path log : logs) {
-                LogEntry entry = new LogEntry(tls.extent, 0, log.toString());
+                LogEntry entry = LogEntry.fromPath(log.toString());
                 tabletMutator.putWal(entry);
               }
             }
@@ -150,9 +150,8 @@ class MetaDataStateStore implements TabletStateStore {
     try (var tabletsMutator = ample.mutateTablets()) {
       for (TabletLocationState tls : tablets) {
         if (tls.suspend != null) {
-          continue;
+          tabletsMutator.mutateTablet(tls.extent).deleteSuspension().mutate();
         }
-        tabletsMutator.mutateTablet(tls.extent).deleteSuspension().mutate();
       }
     } catch (RuntimeException ex) {
       throw new DistributedStoreException(ex);

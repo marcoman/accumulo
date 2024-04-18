@@ -57,7 +57,6 @@ import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -90,9 +89,9 @@ import org.apache.accumulo.core.manager.thrift.Compacting;
 import org.apache.accumulo.core.manager.thrift.ManagerClientService;
 import org.apache.accumulo.core.manager.thrift.TableInfo;
 import org.apache.accumulo.core.manager.thrift.TabletServerStatus;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.TServerInstance;
+import org.apache.accumulo.core.metadata.schema.TabletMetadata;
 import org.apache.accumulo.core.metadata.schema.TabletsMetadata;
 import org.apache.accumulo.core.metrics.MetricsUtil;
 import org.apache.accumulo.core.rpc.ThriftUtil;
@@ -107,7 +106,6 @@ import org.apache.accumulo.core.util.Pair;
 import org.apache.accumulo.core.util.Retry;
 import org.apache.accumulo.core.util.Retry.RetryFactory;
 import org.apache.accumulo.core.util.UtilWaitThread;
-import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.core.util.threads.Threads;
 import org.apache.accumulo.server.AbstractServer;
 import org.apache.accumulo.server.ServerContext;
@@ -130,7 +128,6 @@ import org.apache.accumulo.server.security.SecurityUtil;
 import org.apache.accumulo.server.security.delegation.ZooAuthenticationKeyWatcher;
 import org.apache.accumulo.server.util.ServerBulkImportStatus;
 import org.apache.accumulo.server.util.time.RelativeTime;
-import org.apache.accumulo.server.zookeeper.DistributedWorkQueue;
 import org.apache.accumulo.server.zookeeper.TransactionWatcher;
 import org.apache.accumulo.tserver.TabletServerResourceManager.TabletResourceManager;
 import org.apache.accumulo.tserver.TabletStatsKeeper.Operation;
@@ -227,8 +224,6 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
   private ServiceLock tabletServerLock;
 
   private TServer server;
-
-  private DistributedWorkQueue bulkFailedCopyQ;
 
   private String lockID;
   private volatile long lockSessionId = -1;
@@ -328,17 +323,17 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
         aconf.getTimeInMillis(Property.TSERV_WAL_TOLERATED_MAXIMUM_WAIT_DURATION);
     final RetryFactory walCreationRetryFactory =
         Retry.builder().maxRetries(toleratedWalCreationFailures)
-            .retryAfter(walFailureRetryIncrement, TimeUnit.MILLISECONDS)
-            .incrementBy(walFailureRetryIncrement, TimeUnit.MILLISECONDS)
-            .maxWait(walFailureRetryMax, TimeUnit.MILLISECONDS).backOffFactor(1.5)
-            .logInterval(3, TimeUnit.MINUTES).createFactory();
+            .retryAfter(Duration.ofMillis(walFailureRetryIncrement))
+            .incrementBy(Duration.ofMillis(walFailureRetryIncrement))
+            .maxWait(Duration.ofMillis(walFailureRetryMax)).backOffFactor(1.5)
+            .logInterval(Duration.ofMinutes(3)).createFactory();
     // Tolerate infinite failures for the write, however backing off the same as for creation
     // failures.
-    final RetryFactory walWritingRetryFactory = Retry.builder().infiniteRetries()
-        .retryAfter(walFailureRetryIncrement, TimeUnit.MILLISECONDS)
-        .incrementBy(walFailureRetryIncrement, TimeUnit.MILLISECONDS)
-        .maxWait(walFailureRetryMax, TimeUnit.MILLISECONDS).backOffFactor(1.5)
-        .logInterval(3, TimeUnit.MINUTES).createFactory();
+    final RetryFactory walWritingRetryFactory =
+        Retry.builder().infiniteRetries().retryAfter(Duration.ofMillis(walFailureRetryIncrement))
+            .incrementBy(Duration.ofMillis(walFailureRetryIncrement))
+            .maxWait(Duration.ofMillis(walFailureRetryMax)).backOffFactor(1.5)
+            .logInterval(Duration.ofMinutes(3)).createFactory();
 
     logger = new TabletServerLogger(this, walMaxSize, syncCounter, flushCounter,
         walCreationRetryFactory, walWritingRetryFactory, walMaxAge);
@@ -522,15 +517,14 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
     managerMessages.addLast(m);
   }
 
-  void acquireRecoveryMemory(KeyExtent extent) {
-    if (!extent.isMeta()) {
-      recoveryLock.lock();
-    }
-  }
+  private static final AutoCloseable NOOP_CLOSEABLE = () -> {};
 
-  void releaseRecoveryMemory(KeyExtent extent) {
-    if (!extent.isMeta()) {
-      recoveryLock.unlock();
+  AutoCloseable acquireRecoveryMemory(TabletMetadata tabletMetadata) {
+    if (tabletMetadata.getExtent().isMeta() || tabletMetadata.getLogs().isEmpty()) {
+      return NOOP_CLOSEABLE;
+    } else {
+      recoveryLock.lock();
+      return recoveryLock::unlock;
     }
   }
 
@@ -712,8 +706,8 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
     }
 
     try {
-      MetricsUtil.initializeMetrics(context.getConfiguration(), this.applicationName,
-          clientAddress);
+      MetricsUtil.initializeMetrics(context.getConfiguration(), this.applicationName, clientAddress,
+          getContext().getInstanceName());
 
       metrics = new TabletServerMetrics(this);
       updateMetrics = new TabletServerUpdateMetrics();
@@ -744,21 +738,8 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
       throw new RuntimeException(e);
     }
 
-    ThreadPoolExecutor distWorkQThreadPool = ThreadPools.getServerThreadPools()
-        .createExecutorService(getConfiguration(), Property.TSERV_WORKQ_THREADS, true);
-
-    bulkFailedCopyQ =
-        new DistributedWorkQueue(getContext().getZooKeeperRoot() + Constants.ZBULK_FAILED_COPYQ,
-            getConfiguration(), getContext());
     try {
-      bulkFailedCopyQ.startProcessing(new BulkFailedCopyProcessor(getContext()),
-          distWorkQThreadPool);
-    } catch (Exception e1) {
-      throw new RuntimeException("Failed to start distributed work queue for copying ", e1);
-    }
-
-    try {
-      logSorter.startWatchingForRecoveryLogs(distWorkQThreadPool);
+      logSorter.startWatchingForRecoveryLogs();
     } catch (Exception ex) {
       log.error("Error setting watches for recoveries");
       throw new RuntimeException(ex);
@@ -1078,9 +1059,9 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
   private Durability getMincEventDurability(KeyExtent extent) {
     TableConfiguration conf;
     if (extent.isMeta()) {
-      conf = getContext().getTableConfiguration(RootTable.ID);
+      conf = getContext().getTableConfiguration(AccumuloTable.ROOT.tableId());
     } else {
-      conf = getContext().getTableConfiguration(MetadataTable.ID);
+      conf = getContext().getTableConfiguration(AccumuloTable.METADATA.tableId());
     }
     return DurabilityImpl.fromString(conf.get(Property.TABLE_DURABILITY));
   }
@@ -1101,11 +1082,9 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
   public void recover(VolumeManager fs, KeyExtent extent, List<LogEntry> logEntries,
       Set<String> tabletFiles, MutationReceiver mutationReceiver) throws IOException {
     List<Path> recoveryDirs = new ArrayList<>();
-    List<LogEntry> sorted = new ArrayList<>(logEntries);
-    sorted.sort((e1, e2) -> (int) (e1.timestamp - e2.timestamp));
-    for (LogEntry entry : sorted) {
+    for (LogEntry entry : logEntries) {
       Path recovery = null;
-      Path finished = RecoveryPath.getRecoveryPath(new Path(entry.filename));
+      Path finished = RecoveryPath.getRecoveryPath(new Path(entry.getPath()));
       finished = SortedLogState.getFinishedMarkerPath(finished);
       TabletServer.log.debug("Looking for " + finished);
       if (fs.exists(finished)) {
@@ -1131,21 +1110,6 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
   @Override
   public TableConfiguration getTableConfiguration(KeyExtent extent) {
     return getContext().getTableConfiguration(extent.tableId());
-  }
-
-  public DfsLogger.ServerResources getServerConfig() {
-    return new DfsLogger.ServerResources() {
-
-      @Override
-      public VolumeManager getVolumeManager() {
-        return TabletServer.this.getVolumeManager();
-      }
-
-      @Override
-      public AccumuloConfiguration getConfiguration() {
-        return TabletServer.this.getConfiguration();
-      }
-    };
   }
 
   public SortedMap<KeyExtent,Tablet> getOnlineTablets() {

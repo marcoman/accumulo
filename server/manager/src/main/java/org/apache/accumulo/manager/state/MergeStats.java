@@ -34,8 +34,7 @@ import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.TabletLocationState;
 import org.apache.accumulo.core.metadata.TabletLocationState.BadLocationStateException;
 import org.apache.accumulo.core.metadata.TabletState;
@@ -51,6 +50,9 @@ import org.apache.hadoop.io.DataInputBuffer;
 import org.apache.hadoop.io.Text;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
 
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.context.Scope;
@@ -121,7 +123,7 @@ public class MergeStats {
             info.getExtent());
       }
     }
-    if (state == MergeState.MERGING) {
+    if (state == MergeState.MERGING || state == MergeState.MERGED) {
       if (hosted != 0) {
         // Shouldn't happen
         log.error("Unexpected state: hosted tablets should be zero {} merge {}", hosted,
@@ -141,10 +143,14 @@ public class MergeStats {
 
   private boolean verifyMergeConsistency(AccumuloClient accumuloClient, CurrentState manager)
       throws TableNotFoundException, IOException {
+    // The only expected state when this method is called is WAITING_FOR_OFFLINE
+    verifyState(info, MergeState.WAITING_FOR_OFFLINE);
+
     MergeStats verify = new MergeStats(info);
     KeyExtent extent = info.getExtent();
-    Scanner scanner = accumuloClient
-        .createScanner(extent.isMeta() ? RootTable.NAME : MetadataTable.NAME, Authorizations.EMPTY);
+    Scanner scanner = accumuloClient.createScanner(
+        extent.isMeta() ? AccumuloTable.ROOT.tableName() : AccumuloTable.METADATA.tableName(),
+        Authorizations.EMPTY);
     MetaDataTableScanner.configureScanner(scanner, manager);
     Text start = extent.prevEndRow();
     if (start == null) {
@@ -170,6 +176,12 @@ public class MergeStats {
         break;
       }
 
+      // Verify that no WALs exist
+      if (!verifyWalogs(tls)) {
+        log.debug("failing consistency: {} has walogs {}", tls.extent, tls.walogs.size());
+        return false;
+      }
+
       if (prevExtent == null) {
         // this is the first tablet observed, it must be offline and its prev row must be less than
         // the start of the merge range
@@ -185,7 +197,7 @@ public class MergeStats {
         }
 
       } else if (!tls.extent.isPreviousExtent(prevExtent)) {
-        log.debug("hole in {}", MetadataTable.NAME);
+        log.debug("hole in {}", AccumuloTable.METADATA.tableName());
         return false;
       }
 
@@ -202,6 +214,17 @@ public class MergeStats {
         verify.total);
 
     return unassigned == verify.unassigned && unassigned == verify.total;
+  }
+
+  @VisibleForTesting
+  void verifyState(MergeInfo info, MergeState expectedState) {
+    Preconditions.checkState(info.getState() == expectedState, "Unexpected merge state %s",
+        info.getState());
+  }
+
+  @VisibleForTesting
+  boolean verifyWalogs(TabletLocationState tls) {
+    return tls.walogs.isEmpty();
   }
 
   public static void main(String[] args) throws Exception {

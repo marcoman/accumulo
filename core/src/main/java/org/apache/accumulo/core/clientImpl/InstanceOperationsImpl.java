@@ -20,15 +20,13 @@ package org.apache.accumulo.core.clientImpl;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.MINUTES;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.toList;
 import static org.apache.accumulo.core.rpc.ThriftUtil.createClient;
 import static org.apache.accumulo.core.rpc.ThriftUtil.createTransport;
 import static org.apache.accumulo.core.rpc.ThriftUtil.getClient;
 import static org.apache.accumulo.core.rpc.ThriftUtil.returnClient;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.ConcurrentModificationException;
@@ -138,9 +136,9 @@ public class InstanceOperationsImpl implements InstanceOperations {
 
     var log = LoggerFactory.getLogger(InstanceOperationsImpl.class);
 
-    Retry retry =
-        Retry.builder().infiniteRetries().retryAfter(25, MILLISECONDS).incrementBy(25, MILLISECONDS)
-            .maxWait(30, SECONDS).backOffFactor(1.5).logInterval(3, MINUTES).createRetry();
+    Retry retry = Retry.builder().infiniteRetries().retryAfter(Duration.ofMillis(25))
+        .incrementBy(Duration.ofMillis(25)).maxWait(Duration.ofSeconds(30)).backOffFactor(1.5)
+        .logInterval(Duration.ofMinutes(3)).createRetry();
 
     while (true) {
       try {
@@ -204,6 +202,13 @@ public class InstanceOperationsImpl implements InstanceOperations {
       throws AccumuloException, AccumuloSecurityException {
     return ThriftClientTypes.CLIENT.execute(context, client -> client
         .getConfiguration(TraceUtil.traceInfo(), context.rpcCreds(), ConfigurationType.SITE));
+  }
+
+  @Override
+  public Map<String,String> getSystemProperties()
+      throws AccumuloException, AccumuloSecurityException {
+    return ThriftClientTypes.CLIENT.execute(context,
+        client -> client.getSystemProperties(TraceUtil.traceInfo(), context.rpcCreds()));
   }
 
   @Override
@@ -298,12 +303,12 @@ public class InstanceOperationsImpl implements InstanceOperations {
   public List<ActiveCompaction> getActiveCompactions()
       throws AccumuloException, AccumuloSecurityException {
 
-    Map<String,List<HostAndPort>> compactors = ExternalCompactionUtil.getCompactorAddrs(context);
+    Map<String,Set<HostAndPort>> compactors = ExternalCompactionUtil.getCompactorAddrs(context);
     List<String> tservers = getTabletServers();
 
     int numThreads = Math.max(4, Math.min((tservers.size() + compactors.size()) / 10, 256));
-    var executorService =
-        context.threadPools().createFixedThreadPool(numThreads, "getactivecompactions", false);
+    var executorService = context.threadPools().getPoolBuilder("getactivecompactions")
+        .numCoreThreads(numThreads).build();
     try {
       List<Future<List<ActiveCompaction>>> futures = new ArrayList<>();
 
@@ -345,8 +350,7 @@ public class InstanceOperationsImpl implements InstanceOperations {
 
   @Override
   public void ping(String tserver) throws AccumuloException {
-    try (
-        TTransport transport = createTransport(AddressUtil.parseAddress(tserver, false), context)) {
+    try (TTransport transport = createTransport(AddressUtil.parseAddress(tserver), context)) {
       Client client = createClient(ThriftClientTypes.TABLET_SERVER, transport);
       client.getTabletServerStatus(TraceUtil.traceInfo(), context.rpcCreds());
     } catch (TException e) {

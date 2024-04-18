@@ -18,6 +18,8 @@
  */
 package org.apache.accumulo.server.problems;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
+
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Collections;
@@ -45,8 +47,7 @@ import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.iterators.SortedKeyIterator;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.schema.MetadataSchema.ProblemSection;
 import org.apache.accumulo.core.security.Authorizations;
 import org.apache.accumulo.core.util.threads.ThreadPools;
@@ -69,8 +70,9 @@ public class ProblemReports implements Iterable<ProblemReport> {
    * processed because the whole system is in a really bad state (like HDFS is down) and everything
    * is reporting lots of problems, but problem reports can not be processed
    */
-  private ExecutorService reportExecutor = ThreadPools.getServerThreadPools().createThreadPool(0, 1,
-      60, TimeUnit.SECONDS, "acu-problem-reporter", new LinkedBlockingQueue<>(500), false);
+  private final ExecutorService reportExecutor = ThreadPools.getServerThreadPools()
+      .getPoolBuilder("acu-problem-reporter").numCoreThreads(0).numMaxThreads(1)
+      .withTimeOut(60L, SECONDS).withQueue(new LinkedBlockingQueue<>(500)).build();
 
   private final ServerContext context;
 
@@ -161,7 +163,8 @@ public class ProblemReports implements Iterable<ProblemReport> {
       return;
     }
 
-    Scanner scanner = context.createScanner(MetadataTable.NAME, Authorizations.EMPTY);
+    Scanner scanner =
+        context.createScanner(AccumuloTable.METADATA.tableName(), Authorizations.EMPTY);
     scanner.addScanIterator(new IteratorSetting(1, "keys-only", SortedKeyIterator.class));
 
     scanner.setRange(new Range(ProblemSection.getRowPrefix() + table));
@@ -175,14 +178,15 @@ public class ProblemReports implements Iterable<ProblemReport> {
     }
 
     if (hasProblems) {
-      try (var writer = context.createBatchWriter(MetadataTable.NAME)) {
+      try (var writer = context.createBatchWriter(AccumuloTable.METADATA.tableName())) {
         writer.addMutation(delMut);
       }
     }
   }
 
   private static boolean isMeta(TableId tableId) {
-    return tableId.equals(MetadataTable.ID) || tableId.equals(RootTable.ID);
+    return tableId.equals(AccumuloTable.METADATA.tableId())
+        || tableId.equals(AccumuloTable.ROOT.tableId());
   }
 
   public Iterator<ProblemReport> iterator(final TableId table) {
@@ -216,7 +220,8 @@ public class ProblemReports implements Iterable<ProblemReport> {
         if (iter2 == null) {
           try {
             if ((table == null || !isMeta(table)) && iter1Count == 0) {
-              Scanner scanner = context.createScanner(MetadataTable.NAME, Authorizations.EMPTY);
+              Scanner scanner =
+                  context.createScanner(AccumuloTable.METADATA.tableName(), Authorizations.EMPTY);
               scanner.setTimeout(3, TimeUnit.SECONDS);
 
               if (table == null) {

@@ -18,7 +18,10 @@
  */
 package org.apache.accumulo.manager.tableOps.clone;
 
+import java.util.EnumSet;
+
 import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.zookeeper.DistributedReadWriteLock.LockType;
 import org.apache.accumulo.core.manager.state.tables.TableState;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.ManagerRepo;
@@ -47,18 +50,21 @@ class FinishCloneTable extends ManagerRepo {
     // may never create files.. therefore there is no need to consume namenode space w/ directories
     // that are not used... tablet will create directories as needed
 
+    final EnumSet<TableState> expectedCurrStates = EnumSet.of(TableState.NEW);
     if (cloneInfo.keepOffline) {
-      environment.getTableManager().transitionTableState(cloneInfo.tableId, TableState.OFFLINE);
+      environment.getTableManager().transitionTableState(cloneInfo.tableId, TableState.OFFLINE,
+          expectedCurrStates);
     } else {
-      environment.getTableManager().transitionTableState(cloneInfo.tableId, TableState.ONLINE);
+      environment.getTableManager().transitionTableState(cloneInfo.tableId, TableState.ONLINE,
+          expectedCurrStates);
     }
 
-    Utils.unreserveNamespace(environment, cloneInfo.srcNamespaceId, tid, false);
+    Utils.unreserveNamespace(environment, cloneInfo.srcNamespaceId, tid, LockType.READ);
     if (!cloneInfo.srcNamespaceId.equals(cloneInfo.namespaceId)) {
-      Utils.unreserveNamespace(environment, cloneInfo.namespaceId, tid, false);
+      Utils.unreserveNamespace(environment, cloneInfo.namespaceId, tid, LockType.READ);
     }
-    Utils.unreserveTable(environment, cloneInfo.srcTableId, tid, false);
-    Utils.unreserveTable(environment, cloneInfo.tableId, tid, true);
+    Utils.unreserveTable(environment, cloneInfo.srcTableId, tid, LockType.READ);
+    Utils.unreserveTable(environment, cloneInfo.tableId, tid, LockType.WRITE);
 
     environment.getEventCoordinator().event("Cloned table %s from %s", cloneInfo.tableName,
         cloneInfo.srcTableId);

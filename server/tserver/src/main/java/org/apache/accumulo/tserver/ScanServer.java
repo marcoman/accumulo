@@ -70,11 +70,14 @@ import org.apache.accumulo.core.lock.ServiceLock;
 import org.apache.accumulo.core.lock.ServiceLock.LockLossReason;
 import org.apache.accumulo.core.lock.ServiceLock.LockWatcher;
 import org.apache.accumulo.core.lock.ServiceLockData;
+import org.apache.accumulo.core.lock.ServiceLockData.ServiceDescriptor;
+import org.apache.accumulo.core.lock.ServiceLockData.ServiceDescriptors;
 import org.apache.accumulo.core.lock.ServiceLockData.ThriftService;
 import org.apache.accumulo.core.metadata.ScanServerRefTabletFile;
 import org.apache.accumulo.core.metadata.StoredTabletFile;
 import org.apache.accumulo.core.metadata.schema.Ample;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata;
+import org.apache.accumulo.core.metadata.schema.TabletsMetadata;
 import org.apache.accumulo.core.metrics.MetricsUtil;
 import org.apache.accumulo.core.securityImpl.thrift.TCredentials;
 import org.apache.accumulo.core.tabletscan.thrift.ActiveScan;
@@ -89,6 +92,7 @@ import org.apache.accumulo.core.util.UtilWaitThread;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.server.AbstractServer;
 import org.apache.accumulo.server.ServerContext;
+import org.apache.accumulo.server.client.ClientServiceHandler;
 import org.apache.accumulo.server.compaction.PausedCompactionMetrics;
 import org.apache.accumulo.server.conf.TableConfiguration;
 import org.apache.accumulo.server.fs.VolumeManager;
@@ -96,6 +100,7 @@ import org.apache.accumulo.server.rpc.ServerAddress;
 import org.apache.accumulo.server.rpc.TServerUtils;
 import org.apache.accumulo.server.rpc.ThriftProcessorTypes;
 import org.apache.accumulo.server.security.SecurityUtil;
+import org.apache.accumulo.server.zookeeper.TransactionWatcher;
 import org.apache.accumulo.tserver.TabletServerResourceManager.TabletResourceManager;
 import org.apache.accumulo.tserver.metrics.TabletServerScanMetrics;
 import org.apache.accumulo.tserver.session.MultiScanSession;
@@ -148,10 +153,15 @@ public class ScanServer extends AbstractServer
     @Override
     public Map<? extends KeyExtent,? extends TabletMetadata>
         loadAll(Set<? extends KeyExtent> keys) {
+      Map<KeyExtent,TabletMetadata> tms;
       long t1 = System.currentTimeMillis();
       @SuppressWarnings("unchecked")
-      var tms = ample.readTablets().forTablets((Collection<KeyExtent>) keys, Optional.empty())
-          .build().stream().collect(Collectors.toMap(tm -> tm.getExtent(), tm -> tm));
+      Collection<KeyExtent> extents = (Collection<KeyExtent>) keys;
+      try (TabletsMetadata tabletsMetadata =
+          ample.readTablets().forTablets(extents, Optional.empty()).build()) {
+        tms =
+            tabletsMetadata.stream().collect(Collectors.toMap(TabletMetadata::getExtent, tm -> tm));
+      }
       long t2 = System.currentTimeMillis();
       LOG.trace("Read metadata for {} tablets in {} ms", keys.size(), t2 - t1);
       return tms;
@@ -260,7 +270,10 @@ public class ScanServer extends AbstractServer
 
     // This class implements TabletClientService.Iface and then delegates calls. Be sure
     // to set up the ThriftProcessor using this class, not the delegate.
-    TProcessor processor = ThriftProcessorTypes.getScanServerTProcessor(this, getContext());
+    ClientServiceHandler clientHandler =
+        new ClientServiceHandler(context, new TransactionWatcher(context));
+    TProcessor processor =
+        ThriftProcessorTypes.getScanServerTProcessor(clientHandler, this, getContext());
 
     Property maxMessageSizeProperty =
         (getConfiguration().get(Property.SSERV_MAX_MESSAGE_SIZE) != null
@@ -326,8 +339,14 @@ public class ScanServer extends AbstractServer
       for (int i = 0; i < 120 / 5; i++) {
         zoo.putPersistentData(zLockPath.toString(), new byte[0], NodeExistsPolicy.SKIP);
 
-        if (scanServerLock.tryLock(lw, new ServiceLockData(serverLockUUID, getClientAddressString(),
-            ThriftService.TABLET_SCAN, this.groupName))) {
+        ServiceDescriptors descriptors = new ServiceDescriptors();
+        for (ThriftService svc : new ThriftService[] {ThriftService.CLIENT,
+            ThriftService.TABLET_SCAN}) {
+          descriptors.addService(
+              new ServiceDescriptor(serverLockUUID, svc, getClientAddressString(), this.groupName));
+        }
+
+        if (scanServerLock.tryLock(lw, new ServiceLockData(descriptors))) {
           LOG.debug("Obtained scan server lock {}", scanServerLock.getLockPath());
           return scanServerLock;
         }
@@ -357,7 +376,7 @@ public class ScanServer extends AbstractServer
 
     try {
       MetricsUtil.initializeMetrics(getContext().getConfiguration(), this.applicationName,
-          clientAddress);
+          clientAddress, getContext().getInstanceName());
       scanMetrics = new TabletServerScanMetrics();
       MetricsUtil.initializeProducers(this, scanMetrics);
     } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
@@ -891,7 +910,7 @@ public class ScanServer extends AbstractServer
   public ScanResult continueScan(TInfo tinfo, long scanID, long busyTimeout)
       throws NoSuchScanIDException, NotServingTabletException, TooManyFilesException,
       TSampleNotPresentException, TException {
-    LOG.debug("continue scan: {}", scanID);
+    LOG.trace("continue scan: {}", scanID);
 
     try (ScanReservation reservation = reserveFiles(scanID)) {
       Preconditions.checkState(reservation.getFailures().isEmpty());
@@ -901,7 +920,7 @@ public class ScanServer extends AbstractServer
 
   @Override
   public void closeScan(TInfo tinfo, long scanID) throws TException {
-    LOG.debug("close scan: {}", scanID);
+    LOG.trace("close scan: {}", scanID);
     delegate.closeScan(tinfo, scanID);
   }
 
@@ -939,7 +958,7 @@ public class ScanServer extends AbstractServer
           ssio, authorizations, waitForWrites, tSamplerConfig, batchTimeOut, contextArg,
           executionHints, getBatchScanTabletResolver(tablets), busyTimeout);
 
-      LOG.debug("started scan: {}", ims.getScanID());
+      LOG.trace("started scan: {}", ims.getScanID());
       return ims;
     } catch (TException e) {
       LOG.error("Error starting scan", e);
@@ -953,7 +972,7 @@ public class ScanServer extends AbstractServer
   @Override
   public MultiScanResult continueMultiScan(TInfo tinfo, long scanID, long busyTimeout)
       throws NoSuchScanIDException, TSampleNotPresentException, TException {
-    LOG.debug("continue multi scan: {}", scanID);
+    LOG.trace("continue multi scan: {}", scanID);
 
     try (ScanReservation reservation = reserveFiles(scanID)) {
       Preconditions.checkState(reservation.getFailures().isEmpty());
@@ -963,7 +982,7 @@ public class ScanServer extends AbstractServer
 
   @Override
   public void closeMultiScan(TInfo tinfo, long scanID) throws NoSuchScanIDException, TException {
-    LOG.debug("close multi scan: {}", scanID);
+    LOG.trace("close multi scan: {}", scanID);
     delegate.closeMultiScan(tinfo, scanID);
   }
 

@@ -23,7 +23,6 @@ import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterrup
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.MINUTES;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.toSet;
 import static org.apache.accumulo.core.metadata.schema.TabletMetadata.ColumnType.LOCATION;
@@ -37,6 +36,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -119,8 +119,7 @@ import org.apache.accumulo.core.manager.state.tables.TableState;
 import org.apache.accumulo.core.manager.thrift.FateOperation;
 import org.apache.accumulo.core.manager.thrift.FateService;
 import org.apache.accumulo.core.manager.thrift.ManagerClientService;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.schema.TabletDeletedException;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata.Location;
@@ -196,7 +195,8 @@ public class TableOperationsImpl extends TableOperationsHelper {
   public boolean exists(String tableName) {
     EXISTING_TABLE_NAME.validate(tableName);
 
-    if (tableName.equals(MetadataTable.NAME) || tableName.equals(RootTable.NAME)) {
+    if (tableName.equals(AccumuloTable.METADATA.tableName())
+        || tableName.equals(AccumuloTable.ROOT.tableName())) {
       return true;
     }
 
@@ -493,7 +493,8 @@ public class TableOperationsImpl extends TableOperationsHelper {
     CountDownLatch latch = new CountDownLatch(splits.size());
     AtomicReference<Exception> exception = new AtomicReference<>(null);
 
-    ExecutorService executor = context.threadPools().createFixedThreadPool(16, "addSplits", false);
+    ExecutorService executor =
+        context.threadPools().getPoolBuilder("addSplits").numCoreThreads(16).build();
     try {
       executor.execute(
           new SplitTask(new SplitEnv(tableName, tableId, executor, latch, exception), splits));
@@ -666,9 +667,9 @@ public class TableOperationsImpl extends TableOperationsHelper {
     TableId tableId = context.getTableId(tableName);
 
     while (true) {
-      try {
-        return context.getAmple().readTablets().forTable(tableId).fetch(PREV_ROW).checkConsistency()
-            .build().stream().map(tm -> tm.getExtent().endRow()).filter(Objects::nonNull)
+      try (TabletsMetadata tabletsMetadata = context.getAmple().readTablets().forTable(tableId)
+          .fetch(PREV_ROW).checkConsistency().build()) {
+        return tabletsMetadata.stream().map(tm -> tm.getExtent().endRow()).filter(Objects::nonNull)
             .collect(Collectors.toList());
       } catch (TabletDeletedException tde) {
         // see if the table was deleted
@@ -1020,9 +1021,9 @@ public class TableOperationsImpl extends TableOperationsHelper {
     EXISTING_TABLE_NAME.validate(tableName);
     checkArgument(mapMutator != null, "mapMutator is null");
 
-    Retry retry =
-        Retry.builder().infiniteRetries().retryAfter(25, MILLISECONDS).incrementBy(25, MILLISECONDS)
-            .maxWait(30, SECONDS).backOffFactor(1.5).logInterval(3, MINUTES).createRetry();
+    Retry retry = Retry.builder().infiniteRetries().retryAfter(Duration.ofMillis(25))
+        .incrementBy(Duration.ofMillis(25)).maxWait(Duration.ofSeconds(30)).backOffFactor(1.5)
+        .logInterval(Duration.ofMinutes(3)).createRetry();
 
     while (true) {
       try {
@@ -1320,9 +1321,6 @@ public class TableOperationsImpl extends TableOperationsHelper {
         range = new Range(startRow, lastRow);
       }
 
-      TabletsMetadata tablets = TabletsMetadata.builder(context).scanMetadataTable()
-          .overRange(range).fetch(LOCATION, PREV_ROW).build();
-
       KeyExtent lastExtent = null;
 
       int total = 0;
@@ -1331,34 +1329,38 @@ public class TableOperationsImpl extends TableOperationsHelper {
       Text continueRow = null;
       MapCounter<String> serverCounts = new MapCounter<>();
 
-      for (TabletMetadata tablet : tablets) {
-        total++;
-        Location loc = tablet.getLocation();
+      try (TabletsMetadata tablets = TabletsMetadata.builder(context).scanMetadataTable()
+          .overRange(range).fetch(LOCATION, PREV_ROW).build()) {
 
-        if ((expectedState == TableState.ONLINE
-            && (loc == null || loc.getType() == LocationType.FUTURE))
-            || (expectedState == TableState.OFFLINE && loc != null)) {
-          if (continueRow == null) {
-            continueRow = tablet.getExtent().toMetaRow();
+        for (TabletMetadata tablet : tablets) {
+          total++;
+          Location loc = tablet.getLocation();
+
+          if ((expectedState == TableState.ONLINE
+              && (loc == null || loc.getType() == LocationType.FUTURE))
+              || (expectedState == TableState.OFFLINE && loc != null)) {
+            if (continueRow == null) {
+              continueRow = tablet.getExtent().toMetaRow();
+            }
+            waitFor++;
+            lastRow = tablet.getExtent().toMetaRow();
+
+            if (loc != null) {
+              serverCounts.increment(loc.getHostPortSession(), 1);
+            }
           }
-          waitFor++;
-          lastRow = tablet.getExtent().toMetaRow();
 
-          if (loc != null) {
-            serverCounts.increment(loc.getHostPortSession(), 1);
+          if (!tablet.getExtent().tableId().equals(tableId)) {
+            throw new AccumuloException(
+                "Saw unexpected table Id " + tableId + " " + tablet.getExtent());
           }
-        }
 
-        if (!tablet.getExtent().tableId().equals(tableId)) {
-          throw new AccumuloException(
-              "Saw unexpected table Id " + tableId + " " + tablet.getExtent());
-        }
+          if (lastExtent != null && !tablet.getExtent().isPreviousExtent(lastExtent)) {
+            holes++;
+          }
 
-        if (lastExtent != null && !tablet.getExtent().isPreviousExtent(lastExtent)) {
-          holes++;
+          lastExtent = tablet.getExtent();
         }
-
-        lastExtent = tablet.getExtent();
       }
 
       if (continueRow != null) {
@@ -1503,7 +1505,7 @@ public class TableOperationsImpl extends TableOperationsHelper {
         // this operation may us a lot of memory... its likely that connections to tabletservers
         // hosting metadata tablets will be cached, so do not use cached
         // connections
-        pair = ThriftClientTypes.CLIENT.getTabletServerConnection(context, false);
+        pair = ThriftClientTypes.CLIENT.getThriftServerConnection(context, false);
         diskUsages = pair.getSecond().getDiskUsage(tableNames, context.rpcCreds());
       } catch (ThriftTableOperationException e) {
         switch (e.getType()) {
@@ -1885,9 +1887,9 @@ public class TableOperationsImpl extends TableOperationsHelper {
 
     locator.invalidateCache();
 
-    Retry retry = Retry.builder().infiniteRetries().retryAfter(100, MILLISECONDS)
-        .incrementBy(100, MILLISECONDS).maxWait(2, SECONDS).backOffFactor(1.5)
-        .logInterval(3, MINUTES).createRetry();
+    Retry retry = Retry.builder().infiniteRetries().retryAfter(Duration.ofMillis(100))
+        .incrementBy(Duration.ofMillis(100)).maxWait(Duration.ofSeconds(2)).backOffFactor(1.5)
+        .logInterval(Duration.ofMinutes(3)).createRetry();
 
     while (!locator.binRanges(context, rangeList, binnedRanges).isEmpty()) {
       context.requireTableExists(tableId, tableName);
@@ -2059,8 +2061,11 @@ public class TableOperationsImpl extends TableOperationsHelper {
   @Override
   public TimeType getTimeType(final String tableName) throws TableNotFoundException {
     TableId tableId = context.getTableId(tableName);
-    Optional<TabletMetadata> tabletMetadata = context.getAmple().readTablets().forTable(tableId)
-        .fetch(TabletMetadata.ColumnType.TIME).checkConsistency().build().stream().findFirst();
+    Optional<TabletMetadata> tabletMetadata;
+    try (TabletsMetadata tabletsMetadata = context.getAmple().readTablets().forTable(tableId)
+        .fetch(TabletMetadata.ColumnType.TIME).checkConsistency().build()) {
+      tabletMetadata = tabletsMetadata.stream().findFirst();
+    }
     TabletMetadata timeData =
         tabletMetadata.orElseThrow(() -> new IllegalStateException("Failed to retrieve TimeType"));
     return timeData.getTime().getType();

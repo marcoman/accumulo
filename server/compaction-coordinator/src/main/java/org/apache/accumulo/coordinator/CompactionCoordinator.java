@@ -23,6 +23,7 @@ import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterrup
 import java.lang.reflect.InvocationTargetException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -104,8 +105,6 @@ public class CompactionCoordinator extends AbstractServer
     implements CompactionCoordinatorService.Iface, LiveTServerSet.Listener {
 
   private static final Logger LOG = LoggerFactory.getLogger(CompactionCoordinator.class);
-  private static final long FIFTEEN_MINUTES = TimeUnit.MINUTES.toMillis(15);
-
   protected static final QueueSummaries QUEUE_SUMMARIES = new QueueSummaries();
 
   /*
@@ -145,8 +144,8 @@ public class CompactionCoordinator extends AbstractServer
     super("compaction-coordinator", opts, args);
     aconf = conf == null ? super.getConfiguration() : conf;
     schedExecutor = ThreadPools.getServerThreadPools().createGeneralScheduledExecutorService(aconf);
-    summariesExecutor = ThreadPools.getServerThreadPools().createFixedThreadPool(10,
-        "Compaction Summary Gatherer", false);
+    summariesExecutor = ThreadPools.getServerThreadPools()
+        .getPoolBuilder("Compaction Summary Gatherer").numCoreThreads(10).build();
     compactionFinalizer = createCompactionFinalizer(schedExecutor);
     tserverSet = createLiveTServerSet();
     setupSecurity();
@@ -266,7 +265,7 @@ public class CompactionCoordinator extends AbstractServer
 
     try {
       MetricsUtil.initializeMetrics(getContext().getConfiguration(), this.applicationName,
-          clientAddress);
+          clientAddress, getContext().getInstanceName());
       MetricsUtil.initializeProducers(this);
     } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
         | IllegalArgumentException | InvocationTargetException | NoSuchMethodException
@@ -304,9 +303,12 @@ public class CompactionCoordinator extends AbstractServer
       updateSummaries();
 
       long now = System.currentTimeMillis();
-      TIME_COMPACTOR_LAST_CHECKED.forEach((k, v) -> {
-        if ((now - v) > getMissingCompactorWarningTime()) {
-          LOG.warn("No compactors have checked in with coordinator for queue {} in {}ms", k,
+
+      Map<String,Set<HostAndPort>> idleCompactors = getIdleCompactors();
+      TIME_COMPACTOR_LAST_CHECKED.forEach((queue, lastCheckTime) -> {
+        if ((now - lastCheckTime) > getMissingCompactorWarningTime()
+            && QUEUE_SUMMARIES.isCompactionsQueued(queue) && idleCompactors.containsKey(queue)) {
+          LOG.warn("No compactors have checked in with coordinator for queue {} in {}ms", queue,
               getMissingCompactorWarningTime());
         }
       });
@@ -321,6 +323,28 @@ public class CompactionCoordinator extends AbstractServer
 
     summariesExecutor.shutdownNow();
     LOG.info("Shutting down");
+  }
+
+  private Map<String,Set<HostAndPort>> getIdleCompactors() {
+
+    Map<String,Set<HostAndPort>> allCompactors =
+        ExternalCompactionUtil.getCompactorAddrs(getContext());
+
+    Set<String> emptyQueues = new HashSet<>();
+
+    // Remove all of the compactors that are running a compaction
+    RUNNING_CACHE.values().forEach(rc -> {
+      Set<HostAndPort> busyCompactors = allCompactors.get(rc.getQueueName());
+      if (busyCompactors != null
+          && busyCompactors.remove(HostAndPort.fromString(rc.getCompactorAddress()))) {
+        if (busyCompactors.isEmpty()) {
+          emptyQueues.add(rc.getQueueName());
+        }
+      }
+    });
+    // Remove entries with empty queues
+    emptyQueues.forEach(e -> allCompactors.remove(e));
+    return allCompactors;
   }
 
   private void updateSummaries() {
@@ -382,7 +406,7 @@ public class CompactionCoordinator extends AbstractServer
   }
 
   protected long getMissingCompactorWarningTime() {
-    return FIFTEEN_MINUTES;
+    return getConfiguration().getTimeInMillis(Property.COMPACTOR_MAX_JOB_WAIT_TIME) * 3;
   }
 
   protected long getTServerCheckInterval() {
@@ -492,8 +516,8 @@ public class CompactionCoordinator extends AbstractServer
       throws TTransportException {
     TServerConnection connection = tserverSet.getConnection(tserver);
     ServerContext serverContext = getContext();
-    TTransport transport =
-        serverContext.getTransportPool().getTransport(connection.getAddress(), 0, serverContext);
+    TTransport transport = serverContext.getTransportPool().getTransport(
+        ThriftClientTypes.TABLET_SERVER, connection.getAddress(), 0, serverContext, true);
     return ThriftUtil.createClient(ThriftClientTypes.TABLET_SERVER, transport);
   }
 
@@ -536,7 +560,8 @@ public class CompactionCoordinator extends AbstractServer
       throw new AccumuloSecurityException(credentials.getPrincipal(),
           SecurityErrorCode.PERMISSION_DENIED).asThriftException();
     }
-    LOG.info("Compaction failed, id: {}", externalCompactionId);
+    KeyExtent fromThriftExtent = KeyExtent.fromThrift(extent);
+    LOG.info("Compaction failed: id: {}, extent: {}", externalCompactionId, fromThriftExtent);
     final var ecid = ExternalCompactionId.of(externalCompactionId);
     compactionFailed(Map.of(ecid, KeyExtent.fromThrift(extent)));
   }

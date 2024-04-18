@@ -22,11 +22,13 @@ import static java.util.Objects.requireNonNull;
 
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Objects;
 import java.util.Set;
 
 import org.apache.accumulo.core.dataImpl.KeyExtent;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata.Location;
+import org.apache.accumulo.core.tabletserver.log.LogEntry;
 import org.apache.accumulo.core.util.TextUtil;
 import org.apache.hadoop.io.Text;
 
@@ -56,9 +58,8 @@ public class TabletLocationState {
   }
 
   public TabletLocationState(KeyExtent extent, Location future, Location current, Location last,
-      SuspendingTServer suspend, Collection<Collection<String>> walogs)
-      throws BadLocationStateException {
-    this.extent = extent;
+      SuspendingTServer suspend, Collection<LogEntry> walogs) throws BadLocationStateException {
+    this.extent = Objects.requireNonNull(extent);
     this.future = validateLocation(future, TabletMetadata.LocationType.FUTURE);
     this.current = validateLocation(current, TabletMetadata.LocationType.CURRENT);
     this.last = validateLocation(last, TabletMetadata.LocationType.LAST);
@@ -79,7 +80,7 @@ public class TabletLocationState {
   public final Location current;
   public final Location last;
   public final SuspendingTServer suspend;
-  public final Collection<Collection<String>> walogs;
+  public final Collection<LogEntry> walogs;
 
   public TServerInstance getCurrentServer() {
     return serverInstance(current);

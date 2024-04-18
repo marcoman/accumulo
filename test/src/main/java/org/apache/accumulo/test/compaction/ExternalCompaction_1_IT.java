@@ -18,6 +18,7 @@
  */
 package org.apache.accumulo.test.compaction;
 
+import static com.google.common.collect.MoreCollectors.onlyElement;
 import static org.apache.accumulo.minicluster.ServerType.TABLET_SERVER;
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.MAX_DATA;
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.QUEUE1;
@@ -34,6 +35,8 @@ import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.ge
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.row;
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.verify;
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.writeData;
+import static org.apache.accumulo.test.util.FileMetadataUtil.countFencedFiles;
+import static org.apache.accumulo.test.util.FileMetadataUtil.splitFilesIntoRanges;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -46,6 +49,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
@@ -69,6 +73,7 @@ import org.apache.accumulo.core.client.admin.compaction.CompressionConfigurer;
 import org.apache.accumulo.core.conf.Property;
 import org.apache.accumulo.core.data.Key;
 import org.apache.accumulo.core.data.Mutation;
+import org.apache.accumulo.core.data.Range;
 import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.iterators.DevNull;
@@ -76,7 +81,7 @@ import org.apache.accumulo.core.iterators.Filter;
 import org.apache.accumulo.core.iterators.IteratorEnvironment;
 import org.apache.accumulo.core.iterators.IteratorUtil.IteratorScope;
 import org.apache.accumulo.core.iterators.SortedKeyValueIterator;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.schema.ExternalCompactionFinalState;
 import org.apache.accumulo.core.metadata.schema.ExternalCompactionFinalState.FinalState;
 import org.apache.accumulo.core.metadata.schema.ExternalCompactionId;
@@ -405,23 +410,20 @@ public class ExternalCompaction_1_IT extends SharedMiniClusterBase {
       }
 
       LOG.info("Validating metadata table contents.");
-      TabletsMetadata tm = getCluster().getServerContext().getAmple().readTablets().forTable(tid)
-          .fetch(ColumnType.ECOMP).build();
-      List<TabletMetadata> md = new ArrayList<>();
-      tm.forEach(t -> md.add(t));
-      assertEquals(1, md.size());
-      TabletMetadata m = md.get(0);
-      Map<ExternalCompactionId,ExternalCompactionMetadata> em = m.getExternalCompactions();
-      assertEquals(1, em.size());
-      List<ExternalCompactionFinalState> finished = new ArrayList<>();
-      getFinalStatesForTable(getCluster(), tid).forEach(f -> finished.add(f));
-      assertEquals(1, finished.size());
-      assertEquals(em.entrySet().iterator().next().getKey(),
-          finished.get(0).getExternalCompactionId());
-      tm.close();
+      try (TabletsMetadata tm = getCluster().getServerContext().getAmple().readTablets()
+          .forTable(tid).fetch(ColumnType.ECOMP).build()) {
+        TabletMetadata m = tm.stream().collect(onlyElement());
+        Map<ExternalCompactionId,ExternalCompactionMetadata> em = m.getExternalCompactions();
+        assertEquals(1, em.size());
+        List<ExternalCompactionFinalState> finished = new ArrayList<>();
+        getFinalStatesForTable(getCluster(), tid).forEach(f -> finished.add(f));
+        assertEquals(1, finished.size());
+        assertEquals(em.entrySet().iterator().next().getKey(),
+            finished.get(0).getExternalCompactionId());
+      }
 
       // Force a flush on the metadata table before killing our tserver
-      client.tableOperations().flush(MetadataTable.NAME);
+      client.tableOperations().flush(AccumuloTable.METADATA.tableName());
 
       // Stop our TabletServer. Need to perform a normal shutdown so that the WAL is closed
       // normally.
@@ -447,6 +449,62 @@ public class ExternalCompaction_1_IT extends SharedMiniClusterBase {
       // compaction above in the test. Even though the external compaction was cancelled
       // because we split the table, FaTE will continue to queue up a compaction
       client.tableOperations().cancelCompaction(table3);
+    }
+  }
+
+  @Test
+  public void testExternalCompactionWithFencedFiles() throws Exception {
+    String[] names = this.getUniqueNames(2);
+    try (AccumuloClient client =
+        Accumulo.newClient().from(getCluster().getClientProperties()).build()) {
+
+      String table1 = names[0];
+      createTable(client, table1, "cs1");
+
+      String table2 = names[1];
+      createTable(client, table2, "cs2");
+
+      writeData(client, table1);
+      writeData(client, table2);
+
+      // Verify that all data can be seen
+      verify(client, table1, 1, MAX_DATA);
+      verify(client, table2, 1, MAX_DATA);
+
+      // Split file in table1 into two files each fenced off by 100 rows for a total of 200
+      splitFilesIntoRanges(getCluster().getServerContext(), table1,
+          Set.of(new Range(new Text(row(100)), new Text(row(199))),
+              new Range(new Text(row(300)), new Text(row(399)))));
+      assertEquals(2, countFencedFiles(getCluster().getServerContext(), table1));
+
+      // Fence file in table2 to 600 rows
+      splitFilesIntoRanges(getCluster().getServerContext(), table2,
+          Set.of(new Range(new Text(row(200)), new Text(row(799)))));
+      assertEquals(1, countFencedFiles(getCluster().getServerContext(), table2));
+
+      // Verify that a subset of the data is now seen after fencing
+      verify(client, table1, 1, 200);
+      verify(client, table2, 1, 600);
+
+      getCluster().getClusterControl().startCoordinator(CompactionCoordinator.class);
+      getCluster().getClusterControl().startCompactors(Compactor.class, 1, QUEUE1);
+      getCluster().getClusterControl().startCompactors(Compactor.class, 1, QUEUE2);
+
+      // Compact and verify previousy fenced data didn't come back
+      compact(client, table1, 2, QUEUE1, true);
+      verify(client, table1, 2, 200);
+
+      SortedSet<Text> splits = new TreeSet<>();
+      splits.add(new Text(row(MAX_DATA / 2)));
+      client.tableOperations().addSplits(table2, splits);
+
+      // Compact and verify previousy fenced data didn't come back
+      compact(client, table2, 3, QUEUE2, true);
+      verify(client, table2, 3, 600);
+
+      // should be no more fenced files after compaction
+      assertEquals(0, countFencedFiles(getCluster().getServerContext(), table1));
+      assertEquals(0, countFencedFiles(getCluster().getServerContext(), table2));
     }
   }
 

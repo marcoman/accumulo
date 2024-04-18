@@ -76,9 +76,8 @@ import org.apache.accumulo.core.lock.ServiceLock;
 import org.apache.accumulo.core.logging.TabletLogger;
 import org.apache.accumulo.core.manager.thrift.BulkImportState;
 import org.apache.accumulo.core.manager.thrift.TabletServerStatus;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.ReferencedTabletFile;
-import org.apache.accumulo.core.metadata.RootTable;
 import org.apache.accumulo.core.metadata.schema.ExternalCompactionId;
 import org.apache.accumulo.core.security.Authorizations;
 import org.apache.accumulo.core.securityImpl.thrift.TCredentials;
@@ -91,6 +90,7 @@ import org.apache.accumulo.core.tablet.thrift.TabletManagementClientService;
 import org.apache.accumulo.core.tabletingest.thrift.DataFileInfo;
 import org.apache.accumulo.core.tabletingest.thrift.TDurability;
 import org.apache.accumulo.core.tabletingest.thrift.TabletIngestClientService;
+import org.apache.accumulo.core.tabletserver.log.LogEntry;
 import org.apache.accumulo.core.tabletserver.thrift.ActiveCompaction;
 import org.apache.accumulo.core.tabletserver.thrift.NoSuchScanIDException;
 import org.apache.accumulo.core.tabletserver.thrift.NotServingTabletException;
@@ -142,7 +142,7 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
 
   private static final Logger log = LoggerFactory.getLogger(TabletClientHandler.class);
   private final long MAX_TIME_TO_WAIT_FOR_SCAN_RESULT_MILLIS;
-  private static final long RECENTLY_SPLIT_MILLIES = MINUTES.toMillis(1);
+  private static final long RECENTLY_SPLIT_MILLIS = MINUTES.toMillis(1);
   private final TabletServer server;
   protected final TransactionWatcher watcher;
   protected final ServerContext context;
@@ -263,7 +263,6 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
       us.currentTablet = null;
       us.authFailures.put(keyExtent, SecurityErrorCode.TABLE_DOESNT_EXIST);
       server.updateMetrics.addUnknownTabletErrors(0);
-      return;
     } catch (ThriftSecurityException e) {
       log.error("Denying permission to check user " + us.getUser() + " with user " + e.getUser(),
           e);
@@ -272,7 +271,6 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
       us.currentTablet = null;
       us.authFailures.put(keyExtent, e.getCode());
       server.updateMetrics.addPermissionErrors(0);
-      return;
     }
   }
 
@@ -539,7 +537,8 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
           us.authFailures.entrySet().stream()
               .collect(Collectors.toMap(e -> e.getKey().toThrift(), Entry::getValue)));
     } finally {
-      // Atomically unreserve and delete the session. If there any write stragglers, they will fail
+      // Atomically unreserve and delete the session. If there are any write stragglers, they will
+      // fail
       // after this point.
       server.sessionManager.removeSession(updateID, true);
     }
@@ -761,7 +760,7 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
       String classLoaderContext) throws ThriftSecurityException, TException {
 
     TableId tableId = TableId.of(tableIdStr);
-    Authorizations userauths = null;
+    Authorizations userauths;
     NamespaceId namespaceId = getNamespaceId(credentials, tableId);
     if (!security.canConditionallyUpdate(credentials, tableId, namespaceId)) {
       throw new ThriftSecurityException(credentials.getPrincipal(),
@@ -794,7 +793,8 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
       throw new NoSuchScanIDException();
     }
 
-    if (!cs.tableId.equals(MetadataTable.ID) && !cs.tableId.equals(RootTable.ID)) {
+    if (!cs.tableId.equals(AccumuloTable.METADATA.tableId())
+        && !cs.tableId.equals(AccumuloTable.ROOT.tableId())) {
       try {
         server.resourceManager.waitUntilCommitsAreEnabled();
       } catch (HoldTimeoutException hte) {
@@ -834,7 +834,7 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
     } catch (IOException ioe) {
       throw new TException(ioe);
     } catch (Exception e) {
-      log.warn("Exception returned for conditionalUpdate {}", e);
+      log.warn("Exception returned for conditionalUpdate. tableId: {}, opid: {}", tid, opid, e);
       throw e;
     } finally {
       writeTracker.finishWrite(opid);
@@ -1017,7 +1017,7 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
             for (KeyExtent e2 : onlineOverlapping) {
               Tablet tablet = server.getOnlineTablet(e2);
               if (System.currentTimeMillis() - tablet.getSplitCreationTime()
-                  < RECENTLY_SPLIT_MILLIES) {
+                  < RECENTLY_SPLIT_MILLIS) {
                 all.remove(e2);
               }
             }
@@ -1282,12 +1282,9 @@ public class TabletClientHandler implements TabletServerClientService.Iface,
 
   @Override
   public List<String> getActiveLogs(TInfo tinfo, TCredentials credentials) {
-    String log = server.logger.getLogFile();
-    // Might be null if there no active logger
-    if (log == null) {
-      return Collections.emptyList();
-    }
-    return Collections.singletonList(log);
+    // Might be null if there is no active logger
+    LogEntry le = server.logger.getLogEntry();
+    return le == null ? Collections.emptyList() : Collections.singletonList(le.getPath());
   }
 
   @Override

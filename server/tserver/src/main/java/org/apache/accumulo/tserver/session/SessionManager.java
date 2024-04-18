@@ -19,10 +19,9 @@
 package org.apache.accumulo.tserver.session;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.MINUTES;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.apache.accumulo.core.util.LazySingletons.RANDOM;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -70,12 +69,11 @@ public class SessionManager {
   private final long maxUpdateIdle;
   private final BlockingQueue<Session> deferredCleanupQueue = new ArrayBlockingQueue<>(5000);
   private final Long expiredSessionMarker = (long) -1;
-  private final AccumuloConfiguration aconf;
   private final ServerContext ctx;
 
   public SessionManager(ServerContext context) {
     this.ctx = context;
-    this.aconf = context.getConfiguration();
+    final AccumuloConfiguration aconf = context.getConfiguration();
     maxUpdateIdle = aconf.getTimeInMillis(Property.TSERV_UPDATE_SESSION_MAXIDLE);
     maxIdle = aconf.getTimeInMillis(Property.TSERV_SESSION_MAXIDLE);
 
@@ -230,29 +228,23 @@ public class SessionManager {
       return true;
     }
 
-    boolean removed = false;
-
     synchronized (session) {
       if (session.state == State.RESERVED) {
         return false;
       }
-
       session.state = State.REMOVED;
-      removed = true;
     }
 
-    if (removed) {
-      sessions.remove(sessionId);
-    }
+    sessions.remove(sessionId);
 
-    return removed;
+    return true;
   }
 
   static void cleanup(BlockingQueue<Session> deferredCleanupQueue, Session session) {
     if (!session.cleanup()) {
-      var retry = Retry.builder().infiniteRetries().retryAfter(25, MILLISECONDS)
-          .incrementBy(25, MILLISECONDS).maxWait(5, SECONDS).backOffFactor(1.5)
-          .logInterval(1, MINUTES).createRetry();
+      var retry = Retry.builder().infiniteRetries().retryAfter(Duration.ofMillis(25))
+          .incrementBy(Duration.ofMillis(25)).maxWait(Duration.ofSeconds(5)).backOffFactor(1.5)
+          .logInterval(Duration.ofMinutes(1)).createRetry();
 
       while (!deferredCleanupQueue.offer(session)) {
         if (session.cleanup()) {
@@ -351,7 +343,7 @@ public class SessionManager {
 
     Set<Entry<Long,Session>> copiedIdleSessions = new HashSet<>();
 
-    /**
+    /*
      * Add sessions so that get the list returned in the active scans call
      */
     for (Session session : deferredCleanupQueue) {
@@ -391,7 +383,7 @@ public class SessionManager {
     final long ct = System.currentTimeMillis();
     final Set<Entry<Long,Session>> copiedIdleSessions = new HashSet<>();
 
-    /**
+    /*
      * Add sessions so that get the list returned in the active scans call
      */
     for (Session session : deferredCleanupQueue) {
