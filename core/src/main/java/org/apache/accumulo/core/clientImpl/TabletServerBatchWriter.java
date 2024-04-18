@@ -19,8 +19,6 @@
 package org.apache.accumulo.core.clientImpl;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.MINUTES;
-import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
@@ -29,6 +27,7 @@ import java.io.IOException;
 import java.lang.management.CompilationMXBean;
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -672,11 +671,11 @@ public class TabletServerBatchWriter implements AutoCloseable {
     public MutationWriter(int numSendThreads) {
       serversMutations = new HashMap<>();
       queued = new HashSet<>();
-      sendThreadPool = context.threadPools().createFixedThreadPool(numSendThreads,
-          this.getClass().getName(), false);
+      sendThreadPool = context.threadPools().getPoolBuilder(this.getClass().getName())
+          .numCoreThreads(numSendThreads).build();
       locators = new HashMap<>();
-      binningThreadPool = context.threadPools().createFixedThreadPool(1, "BinMutations",
-          new SynchronousQueue<>(), false);
+      binningThreadPool = context.threadPools().getPoolBuilder("BinMutations").numCoreThreads(1)
+          .withQueue(new SynchronousQueue<>()).build();
       binningThreadPool.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
     }
 
@@ -1093,9 +1092,9 @@ public class TabletServerBatchWriter implements AutoCloseable {
 
       private void cancelSession() throws InterruptedException, ThriftSecurityException {
 
-        Retry retry = Retry.builder().infiniteRetries().retryAfter(100, MILLISECONDS)
-            .incrementBy(100, MILLISECONDS).maxWait(60, SECONDS).backOffFactor(1.5)
-            .logInterval(3, MINUTES).createRetry();
+        Retry retry = Retry.builder().infiniteRetries().retryAfter(Duration.ofMillis(100))
+            .incrementBy(Duration.ofMillis(100)).maxWait(Duration.ofMinutes(1)).backOffFactor(1.5)
+            .logInterval(Duration.ofMinutes(3)).createRetry();
 
         final HostAndPort parsedServer = HostAndPort.fromString(location);
 

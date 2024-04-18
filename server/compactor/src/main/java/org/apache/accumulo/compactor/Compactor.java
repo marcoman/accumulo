@@ -69,6 +69,8 @@ import org.apache.accumulo.core.lock.ServiceLock;
 import org.apache.accumulo.core.lock.ServiceLock.LockLossReason;
 import org.apache.accumulo.core.lock.ServiceLock.LockWatcher;
 import org.apache.accumulo.core.lock.ServiceLockData;
+import org.apache.accumulo.core.lock.ServiceLockData.ServiceDescriptor;
+import org.apache.accumulo.core.lock.ServiceLockData.ServiceDescriptors;
 import org.apache.accumulo.core.lock.ServiceLockData.ThriftService;
 import org.apache.accumulo.core.metadata.ReferencedTabletFile;
 import org.apache.accumulo.core.metadata.StoredTabletFile;
@@ -92,6 +94,7 @@ import org.apache.accumulo.core.util.compaction.ExternalCompactionUtil;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.core.util.threads.Threads;
 import org.apache.accumulo.server.AbstractServer;
+import org.apache.accumulo.server.client.ClientServiceHandler;
 import org.apache.accumulo.server.compaction.CompactionInfo;
 import org.apache.accumulo.server.compaction.CompactionWatcher;
 import org.apache.accumulo.server.compaction.FileCompactor;
@@ -103,7 +106,7 @@ import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.accumulo.server.rpc.ServerAddress;
 import org.apache.accumulo.server.rpc.TServerUtils;
 import org.apache.accumulo.server.rpc.ThriftProcessorTypes;
-import org.apache.accumulo.server.security.SecurityOperation;
+import org.apache.accumulo.server.zookeeper.TransactionWatcher;
 import org.apache.hadoop.fs.Path;
 import org.apache.thrift.TException;
 import org.apache.thrift.transport.TTransportException;
@@ -127,13 +130,10 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
   protected static final CompactionJobHolder JOB_HOLDER = new CompactionJobHolder();
 
   private final UUID compactorId = UUID.randomUUID();
-  private final AccumuloConfiguration aconf;
   private final String queueName;
   protected final AtomicReference<ExternalCompactionId> currentCompactionId =
       new AtomicReference<>();
-  private final CompactionWatcher watcher;
 
-  private SecurityOperation security;
   private ServiceLock compactorLock;
   private ServerAddress compactorAddress = null;
   private PausedCompactionMetrics pausedMetrics;
@@ -144,24 +144,8 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
   private final AtomicBoolean compactionRunning = new AtomicBoolean(false);
 
   protected Compactor(ConfigOpts opts, String[] args) {
-    this(opts, args, null);
-  }
-
-  protected Compactor(ConfigOpts opts, String[] args, AccumuloConfiguration conf) {
     super("compactor", opts, args);
-    aconf = conf == null ? super.getConfiguration() : conf;
-    queueName = aconf.get(Property.COMPACTOR_QUEUE_NAME);
-    setupSecurity();
-    watcher = new CompactionWatcher(aconf);
-    var schedExecutor =
-        ThreadPools.getServerThreadPools().createGeneralScheduledExecutorService(aconf);
-    startCancelChecker(schedExecutor, TIME_BETWEEN_CANCEL_CHECKS);
-    printStartupMsg();
-  }
-
-  @Override
-  public AccumuloConfiguration getConfiguration() {
-    return aconf;
+    queueName = super.getConfiguration().get(Property.COMPACTOR_QUEUE_NAME);
   }
 
   @Override
@@ -170,10 +154,6 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
     LongTaskTimer timer = LongTaskTimer.builder(METRICS_COMPACTOR_MAJC_STUCK)
         .description("Number and duration of stuck major compactions").register(registry);
     CompactionWatcher.setTimer(timer);
-  }
-
-  protected void setupSecurity() {
-    security = getContext().getSecurityOperation();
   }
 
   protected void startCancelChecker(ScheduledThreadPoolExecutor schedExecutor,
@@ -222,11 +202,6 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
             job.getExternalCompactionId(), KeyExtent.fromThrift(job.getExtent()), e);
       }
     }
-  }
-
-  protected void printStartupMsg() {
-    LOG.info("Version " + Constants.VERSION);
-    LOG.info("Instance " + getContext().getInstanceID());
   }
 
   /**
@@ -278,8 +253,13 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
       for (int i = 0; i < 25; i++) {
         zoo.putPersistentData(zPath, new byte[0], NodeExistsPolicy.SKIP);
 
-        if (compactorLock.tryLock(lw,
-            new ServiceLockData(compactorId, hostPort, ThriftService.COMPACTOR, this.queueName))) {
+        ServiceDescriptors descriptors = new ServiceDescriptors();
+        for (ThriftService svc : new ThriftService[] {ThriftService.CLIENT,
+            ThriftService.COMPACTOR}) {
+          descriptors.addService(new ServiceDescriptor(compactorId, svc, hostPort, this.queueName));
+        }
+
+        if (compactorLock.tryLock(lw, new ServiceLockData(descriptors))) {
           LOG.debug("Obtained Compactor lock {}", compactorLock.getLockPath());
           return;
         }
@@ -302,7 +282,10 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
    * @throws UnknownHostException host unknown
    */
   protected ServerAddress startCompactorClientService() throws UnknownHostException {
-    var processor = ThriftProcessorTypes.getCompactorTProcessor(this, getContext());
+
+    ClientServiceHandler clientHandler =
+        new ClientServiceHandler(getContext(), new TransactionWatcher(getContext()));
+    var processor = ThriftProcessorTypes.getCompactorTProcessor(clientHandler, this, getContext());
     Property maxMessageSizeProperty =
         (getConfiguration().get(Property.COMPACTOR_MAX_MESSAGE_SIZE) != null
             ? Property.COMPACTOR_MAX_MESSAGE_SIZE : Property.GENERAL_MAX_MESSAGE_SIZE);
@@ -337,7 +320,7 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
     TableId tableId = JOB_HOLDER.getTableId();
     try {
       NamespaceId nsId = getContext().getNamespaceId(tableId);
-      if (!security.canCompact(credentials, tableId, nsId)) {
+      if (!getContext().getSecurityOperation().canCompact(credentials, tableId, nsId)) {
         throw new AccumuloSecurityException(credentials.getPrincipal(),
             SecurityErrorCode.PERMISSION_DENIED).asThriftException();
       }
@@ -425,8 +408,13 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
    * @throws RetriesExceededException thrown when retries have been exceeded
    */
   protected TExternalCompactionJob getNextJob(Supplier<UUID> uuid) throws RetriesExceededException {
+    final long startingWaitTime =
+        getConfiguration().getTimeInMillis(Property.COMPACTOR_MIN_JOB_WAIT_TIME);
+    final long maxWaitTime =
+        getConfiguration().getTimeInMillis(Property.COMPACTOR_MAX_JOB_WAIT_TIME);
+
     RetryableThriftCall<TExternalCompactionJob> nextJobThriftCall =
-        new RetryableThriftCall<>(1000, RetryableThriftCall.MAX_WAIT_TIME, 0, () -> {
+        new RetryableThriftCall<>(startingWaitTime, maxWaitTime, 0, () -> {
           Client coordinatorClient = getCoordinatorClient();
           try {
             ExternalCompactionId eci = ExternalCompactionId.generate(uuid.get());
@@ -539,7 +527,9 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
       } catch (FileCompactor.CompactionCanceledException cce) {
         LOG.debug("Compaction canceled {}", job.getExternalCompactionId());
       } catch (Exception e) {
-        LOG.error("Compaction failed", e);
+        KeyExtent fromThriftExtent = KeyExtent.fromThrift(job.getExtent());
+        LOG.error("Compaction failed: id: {}, extent: {}", job.getExternalCompactionId(),
+            fromThriftExtent, e);
         err.set(e);
       } finally {
         stopped.countDown();
@@ -565,12 +555,14 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
   protected long getWaitTimeBetweenCompactionChecks() {
     // get the total number of compactors assigned to this queue
     int numCompactors = ExternalCompactionUtil.countCompactors(queueName, getContext());
-    // Aim for around 3 compactors checking in every second
-    long sleepTime = numCompactors * 1000L / 3;
-    // Ensure a compactor sleeps at least around a second
-    sleepTime = Math.max(1000, sleepTime);
-    // Ensure a compactor sleep not too much more than 5 mins
-    sleepTime = Math.min(300_000L, sleepTime);
+    long minWait = getConfiguration().getTimeInMillis(Property.COMPACTOR_MIN_JOB_WAIT_TIME);
+    // Aim for around 3 compactors checking in per min wait time.
+    long sleepTime = numCompactors * minWait / 3;
+    // Ensure a compactor waits at least the minimum time
+    sleepTime = Math.max(minWait, sleepTime);
+    // Ensure a sleeping compactor has a configurable max sleep time
+    sleepTime = Math.min(getConfiguration().getTimeInMillis(Property.COMPACTOR_MAX_JOB_WAIT_TIME),
+        sleepTime);
     // Add some random jitter to the sleep time, that averages out to sleep time. This will spread
     // compactors out evenly over time.
     sleepTime = (long) (.9 * sleepTime + sleepTime * .2 * RANDOM.get().nextDouble());
@@ -596,7 +588,7 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
 
     try {
       MetricsUtil.initializeMetrics(getContext().getConfiguration(), this.applicationName,
-          clientAddress);
+          clientAddress, getContext().getInstanceName());
       pausedMetrics = new PausedCompactionMetrics();
       MetricsUtil.initializeProducers(this, pausedMetrics);
     } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
@@ -604,6 +596,11 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
         | SecurityException e1) {
       LOG.error("Error initializing metrics, metrics will not be emitted.", e1);
     }
+
+    var watcher = new CompactionWatcher(getConfiguration());
+    var schedExecutor = ThreadPools.getServerThreadPools()
+        .createGeneralScheduledExecutorService(getConfiguration());
+    startCancelChecker(schedExecutor, TIME_BETWEEN_CANCEL_CHECKS);
 
     LOG.info("Compactor started, waiting for work");
     try {
@@ -680,7 +677,7 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
                 }
               }
             } else {
-              LOG.error("Waiting on compaction thread to finish, but no RUNNING compaction");
+              LOG.debug("Waiting on compaction thread to finish, but no RUNNING compaction");
             }
           }
           compactionThread.join();
@@ -709,14 +706,17 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
               currentCompactionId.set(null);
             }
           } else if (err.get() != null) {
+            KeyExtent fromThriftExtent = KeyExtent.fromThrift(job.getExtent());
             try {
-              LOG.info("Updating coordinator with compaction failure.");
+              LOG.info("Updating coordinator with compaction failure: id: {}, extent: {}",
+                  job.getExternalCompactionId(), fromThriftExtent);
               TCompactionStatusUpdate update = new TCompactionStatusUpdate(TCompactionState.FAILED,
                   "Compaction failed due to: " + err.get().getMessage(), -1, -1, -1);
               updateCompactionState(job, update);
               updateCompactionFailed(job);
             } catch (RetriesExceededException e) {
-              LOG.error("Error updating coordinator with compaction failure.", e);
+              LOG.error("Error updating coordinator with compaction failure: id: {}, extent: {}",
+                  job.getExternalCompactionId(), fromThriftExtent, e);
             } finally {
               currentCompactionId.set(null);
             }
@@ -800,7 +800,7 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
   @Override
   public List<ActiveCompaction> getActiveCompactions(TInfo tinfo, TCredentials credentials)
       throws ThriftSecurityException, TException {
-    if (!security.canPerformSystemActions(credentials)) {
+    if (!getContext().getSecurityOperation().canPerformSystemActions(credentials)) {
       throw new AccumuloSecurityException(credentials.getPrincipal(),
           SecurityErrorCode.PERMISSION_DENIED).asThriftException();
     }
@@ -827,7 +827,7 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
   public TExternalCompactionJob getRunningCompaction(TInfo tinfo, TCredentials credentials)
       throws ThriftSecurityException, TException {
     // do not expect users to call this directly, expect other tservers to call this method
-    if (!security.canPerformSystemActions(credentials)) {
+    if (!getContext().getSecurityOperation().canPerformSystemActions(credentials)) {
       throw new AccumuloSecurityException(credentials.getPrincipal(),
           SecurityErrorCode.PERMISSION_DENIED).asThriftException();
     }
@@ -852,7 +852,7 @@ public class Compactor extends AbstractServer implements MetricsProducer, Compac
   public String getRunningCompactionId(TInfo tinfo, TCredentials credentials)
       throws ThriftSecurityException, TException {
     // do not expect users to call this directly, expect other tservers to call this method
-    if (!security.canPerformSystemActions(credentials)) {
+    if (!getContext().getSecurityOperation().canPerformSystemActions(credentials)) {
       throw new AccumuloSecurityException(credentials.getPrincipal(),
           SecurityErrorCode.PERMISSION_DENIED).asThriftException();
     }

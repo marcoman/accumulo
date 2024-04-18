@@ -18,9 +18,9 @@
  */
 package org.apache.accumulo.tserver.tablet;
 
-import static org.apache.accumulo.core.spi.compaction.CompactionKind.SELECTOR;
 import static org.apache.accumulo.core.spi.compaction.CompactionKind.SYSTEM;
 import static org.apache.accumulo.core.spi.compaction.CompactionKind.USER;
+import static org.apache.accumulo.core.util.compaction.DeprecatedCompactionKind.SELECTOR;
 import static org.apache.accumulo.tserver.tablet.CompactableImplFileManagerTest.TestFileManager.SELECTION_EXPIRATION;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -280,6 +280,40 @@ public class CompactableImplFileManagerTest {
 
     fileMgr.finishSelection(newFiles("F00000.rf", "F00001.rf"), false);
     assertEquals(FileSelectionStatus.SELECTED, fileMgr.getSelectionStatus());
+  }
+
+  @Test
+  public void testUserCompactionPreemptsSelectorCompaction() {
+    TestFileManager fileMgr = new TestFileManager();
+
+    assertTrue(fileMgr.initiateSelection(SELECTOR));
+    assertEquals(SELECTOR, fileMgr.getSelectionKind());
+    assertTrue(fileMgr.beginSelection());
+    // USER compaction should not be able to preempt while in the middle of selecting files
+    assertFalse(fileMgr.initiateSelection(USER));
+    assertEquals(SELECTOR, fileMgr.getSelectionKind());
+    fileMgr.finishSelection(newFiles("F00000.rf", "F00001.rf", "F00002.rf"), false);
+    // check state is as expected after finishing selection
+    assertEquals(SELECTOR, fileMgr.getSelectionKind());
+    assertEquals(FileSelectionStatus.SELECTED, fileMgr.getSelectionStatus());
+    assertFalse(fileMgr.getSelectedFiles().isEmpty());
+
+    // USER compaction should not be able to preempt when there are running compactions.
+    fileMgr.running.add(SELECTOR);
+    assertFalse(fileMgr.initiateSelection(USER));
+    // check state is as expected
+    assertEquals(SELECTOR, fileMgr.getSelectionKind());
+    assertEquals(FileSelectionStatus.SELECTED, fileMgr.getSelectionStatus());
+    assertFalse(fileMgr.getSelectedFiles().isEmpty());
+
+    // after file selection is complete and there are no running compactions, should be able to
+    // preempt
+    fileMgr.running.clear();
+    assertTrue(fileMgr.initiateSelection(USER));
+    // check that things were properly reset
+    assertEquals(USER, fileMgr.getSelectionKind());
+    assertEquals(FileSelectionStatus.NEW, fileMgr.getSelectionStatus());
+    assertTrue(fileMgr.getSelectedFiles().isEmpty());
   }
 
   @Test

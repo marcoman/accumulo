@@ -53,7 +53,7 @@ import org.apache.accumulo.core.gc.Reference;
 import org.apache.accumulo.core.gc.ReferenceDirectory;
 import org.apache.accumulo.core.gc.ReferenceFile;
 import org.apache.accumulo.core.manager.state.tables.TableState;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.RootTable;
 import org.apache.accumulo.core.metadata.StoredTabletFile;
 import org.apache.accumulo.core.metadata.ValidationUtil;
@@ -64,7 +64,6 @@ import org.apache.accumulo.core.metadata.schema.MetadataSchema;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata;
 import org.apache.accumulo.core.metadata.schema.TabletsMetadata;
 import org.apache.accumulo.core.security.Authorizations;
-import org.apache.accumulo.core.util.Pair;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.core.volume.Volume;
 import org.apache.accumulo.server.ServerContext;
@@ -176,43 +175,45 @@ public class GCRun implements GarbageCollectionEnvironment {
     if (level == Ample.DataLevel.ROOT) {
       tabletStream = Stream.of(context.getAmple().readTablet(RootTable.EXTENT, DIR, FILES, SCANS));
     } else {
-      var tabletsMetadata = TabletsMetadata.builder(context).scanTable(level.metaTable())
-          .checkConsistency().fetch(DIR, FILES, SCANS).build();
-      tabletStream = tabletsMetadata.stream();
+      tabletStream = TabletsMetadata.builder(context).scanTable(level.metaTable())
+          .checkConsistency().fetch(DIR, FILES, SCANS).build().stream();
     }
 
     // there is a lot going on in this "one line" so see below for more info
     var tabletReferences = tabletStream.flatMap(tm -> {
+      var tableId = tm.getTableId();
 
       // verify that dir and prev row entries present for to check for complete row scan
-      log.trace("tablet metadata table id: {}, end row:{}, dir:{}, saw: {}, prev row: {}",
-          tm.getTableId(), tm.getEndRow(), tm.getDirName(), tm.sawPrevEndRow(), tm.getPrevEndRow());
+      log.trace("tablet metadata table id: {}, end row:{}, dir:{}, saw: {}, prev row: {}", tableId,
+          tm.getEndRow(), tm.getDirName(), tm.sawPrevEndRow(), tm.getPrevEndRow());
       if (tm.getDirName() == null || tm.getDirName().isEmpty() || !tm.sawPrevEndRow()) {
-        throw new IllegalStateException("possible incomplete metadata scan for table id: "
-            + tm.getTableId() + ", end row: " + tm.getEndRow() + ", dir: " + tm.getDirName()
-            + ", saw prev row: " + tm.sawPrevEndRow());
+        throw new IllegalStateException("possible incomplete metadata scan for table id: " + tableId
+            + ", end row: " + tm.getEndRow() + ", dir: " + tm.getDirName() + ", saw prev row: "
+            + tm.sawPrevEndRow());
       }
 
       // combine all the entries read from file and scan columns in the metadata table
-      Stream<StoredTabletFile> fileStream = tm.getFiles().stream();
+      Stream<StoredTabletFile> stfStream = tm.getFiles().stream();
+      // map the files to Reference objects
+      var fileStream = stfStream.map(f -> ReferenceFile.forFile(tableId, f));
+
       // scans are normally empty, so only introduce a layer of indirection when needed
       final var tmScans = tm.getScans();
       if (!tmScans.isEmpty()) {
-        fileStream = Stream.concat(fileStream, tmScans.stream());
+        var scanStream = tmScans.stream().map(s -> ReferenceFile.forScan(tableId, s));
+        fileStream = Stream.concat(fileStream, scanStream);
       }
-      // map the files to Reference objects
-      var stream = fileStream.map(f -> new ReferenceFile(tm.getTableId(), f));
-      // if dirName is populated then we have a tablet directory aka srv:dir
+      // if dirName is populated, then we have a tablet directory aka srv:dir
       if (tm.getDirName() != null) {
         // add the tablet directory to the stream
-        var tabletDir = new ReferenceDirectory(tm.getTableId(), tm.getDirName());
-        stream = Stream.concat(stream, Stream.of(tabletDir));
+        var tabletDir = new ReferenceDirectory(tableId, tm.getDirName());
+        fileStream = Stream.concat(fileStream, Stream.of(tabletDir));
       }
-      return stream;
+      return fileStream;
     });
 
     var scanServerRefs = context.getAmple().getScanServerFileReferences()
-        .map(sfr -> new ReferenceFile(sfr.getTableId(), sfr));
+        .map(sfr -> ReferenceFile.forScan(sfr.getTableId(), sfr));
 
     return Stream.concat(tabletReferences, scanServerRefs);
   }
@@ -263,7 +264,7 @@ public class GCRun implements GarbageCollectionEnvironment {
       throws TableNotFoundException {
     final VolumeManager fs = context.getVolumeManager();
     var metadataLocation = level == Ample.DataLevel.ROOT
-        ? context.getZooKeeperRoot() + " for " + RootTable.NAME : level.metaTable();
+        ? context.getZooKeeperRoot() + " for " + AccumuloTable.ROOT.tableName() : level.metaTable();
 
     if (inSafeMode()) {
       System.out.println("SAFEMODE: There are " + confirmedDeletes.size()
@@ -282,9 +283,9 @@ public class GCRun implements GarbageCollectionEnvironment {
     minimizeDeletes(confirmedDeletes, processedDeletes, fs, log);
 
     ExecutorService deleteThreadPool = ThreadPools.getServerThreadPools()
-        .createExecutorService(config, Property.GC_DELETE_THREADS, false);
+        .createExecutorService(config, Property.GC_DELETE_THREADS);
 
-    final List<Pair<Path,Path>> replacements = context.getVolumeReplacements();
+    final Map<Path,Path> replacements = context.getVolumeReplacements();
 
     for (final GcCandidate delete : confirmedDeletes.values()) {
 
@@ -471,16 +472,6 @@ public class GCRun implements GarbageCollectionEnvironment {
   }
 
   /**
-   * Checks if InUse Candidates can be removed.
-   *
-   * @return value of {@link Property#GC_REMOVE_IN_USE_CANDIDATES}
-   */
-  @Override
-  public boolean canRemoveInUseCandidates() {
-    return context.getConfiguration().getBoolean(Property.GC_REMOVE_IN_USE_CANDIDATES);
-  }
-
-  /**
    * Moves a file to trash. If this garbage collector is not using trash, this method returns false
    * and leaves the file alone. If the file is missing, this method returns false as opposed to
    * throwing an exception.
@@ -539,9 +530,9 @@ public class GCRun implements GarbageCollectionEnvironment {
   @Override
   public Set<TableId> getCandidateTableIDs() throws InterruptedException {
     if (level == DataLevel.ROOT) {
-      return Set.of(RootTable.ID);
+      return Set.of(AccumuloTable.ROOT.tableId());
     } else if (level == DataLevel.METADATA) {
-      return Set.of(MetadataTable.ID);
+      return Set.of(AccumuloTable.METADATA.tableId());
     } else if (level == DataLevel.USER) {
       Set<TableId> tableIds = new HashSet<>();
       getTableIDs().forEach((k, v) -> {
@@ -551,8 +542,8 @@ public class GCRun implements GarbageCollectionEnvironment {
           tableIds.add(k);
         }
       });
-      tableIds.remove(MetadataTable.ID);
-      tableIds.remove(RootTable.ID);
+      tableIds.remove(AccumuloTable.METADATA.tableId());
+      tableIds.remove(AccumuloTable.ROOT.tableId());
       return tableIds;
     } else {
       throw new IllegalArgumentException("Unexpected level in GC Env: " + this.level.name());

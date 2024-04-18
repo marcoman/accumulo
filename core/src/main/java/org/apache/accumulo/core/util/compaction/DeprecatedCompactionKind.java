@@ -16,12 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.accumulo.core.metadata;
+package org.apache.accumulo.core.util.compaction;
 
-import org.apache.accumulo.core.clientImpl.Namespace;
-import org.apache.accumulo.core.data.TableId;
+import org.apache.accumulo.core.spi.compaction.CompactionKind;
 
-public class MetadataTable {
-  public static final TableId ID = TableId.of("!0");
-  public static final String NAME = Namespace.ACCUMULO.name() + ".metadata";
+// The purpose of this class is to minimize the amount of code that has to suppress deprecation warnings.
+public class DeprecatedCompactionKind {
+  @SuppressWarnings("deprecation")
+  public static final CompactionKind SELECTOR = CompactionKind.SELECTOR;
 }
