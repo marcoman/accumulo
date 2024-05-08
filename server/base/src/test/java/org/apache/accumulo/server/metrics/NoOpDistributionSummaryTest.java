@@ -16,23 +16,20 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.accumulo.manager.metrics;
+package org.apache.accumulo.server.metrics;
 
-import java.util.ArrayList;
-import java.util.List;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
-import org.apache.accumulo.core.conf.AccumuloConfiguration;
-import org.apache.accumulo.core.conf.Property;
-import org.apache.accumulo.core.metrics.MetricsProducer;
-import org.apache.accumulo.manager.Manager;
-import org.apache.accumulo.manager.metrics.fate.FateMetrics;
+import org.junit.jupiter.api.Test;
 
-public class ManagerMetrics {
-
-  public static List<MetricsProducer> getProducers(AccumuloConfiguration conf, Manager manager) {
-    ArrayList<MetricsProducer> producers = new ArrayList<>();
-    producers.add(new FateMetrics(manager.getContext(),
-        conf.getTimeInMillis(Property.MANAGER_FATE_METRICS_MIN_UPDATE_INTERVAL)));
-    return producers;
+class NoOpDistributionSummaryTest {
+  @Test
+  public void testNoOp() {
+    NoOpDistributionSummary noop = new NoOpDistributionSummary();
+    assertDoesNotThrow(() -> noop.getId());
+    assertDoesNotThrow(() -> noop.takeSnapshot());
+    assertDoesNotThrow(() -> noop.max());
+    assertDoesNotThrow(() -> noop.count());
+    assertDoesNotThrow(() -> noop.totalAmount());
   }
 }
