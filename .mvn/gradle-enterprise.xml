@@ -37,6 +37,7 @@
     </local>
     <remote>
       <enabled>true</enabled>
+      <storeEnabled>true</storeEnabled>
       <server>
         <allowInsecureProtocol>true</allowInsecureProtocol>
       </server>
