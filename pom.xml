@@ -664,7 +664,6 @@
                   <exclude>**/NOTICE</exclude>
                   <exclude>**/target/**</exclude>
                   <exclude>**/*.rf</exclude>
-                  <exclude>**/Jenkinsfile</exclude>
                 </excludes>
               </licenseSet>
             </licenseSets>
@@ -871,6 +870,7 @@
               <exclude>.factorypath</exclude>
               <exclude>.github/**</exclude>
               <exclude>**/*.rf</exclude>
+              <exclude>Jenkinsfile</exclude>
             </excludes>
           </configuration>
         </plugin>
