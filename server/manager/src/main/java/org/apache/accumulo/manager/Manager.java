@@ -39,6 +39,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
@@ -71,6 +72,8 @@ import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
 import org.apache.accumulo.core.fate.AgeOffStore;
 import org.apache.accumulo.core.fate.Fate;
+import org.apache.accumulo.core.fate.TStore;
+import org.apache.accumulo.core.fate.zookeeper.ZooCache.ZcStat;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeExistsPolicy;
@@ -179,7 +182,7 @@ public class Manager extends AbstractServer
   static final Logger log = LoggerFactory.getLogger(Manager.class);
 
   static final int ONE_SECOND = 1000;
-  private static final long TIME_BETWEEN_MIGRATION_CLEANUPS = 5 * 60 * ONE_SECOND;
+  private static final long CLEANUP_INTERVAL_MINUTES = 5;
   static final long WAIT_BETWEEN_ERRORS = ONE_SECOND;
   private static final long DEFAULT_WAIT_FOR_WATCHER = 10 * ONE_SECOND;
   private static final int MAX_CLEANUP_WAIT_TIME = ONE_SECOND;
@@ -420,7 +423,7 @@ public class Manager extends AbstractServer
     }
   }
 
-  Manager(ConfigOpts opts, String[] args) throws IOException {
+  protected Manager(ConfigOpts opts, String[] args) throws IOException {
     super("manager", opts, args);
     ServerContext context = super.getContext();
     balancerEnvironment = new BalancerEnvironmentImpl(context);
@@ -694,7 +697,7 @@ public class Manager extends AbstractServer
             log.error("Error cleaning up migrations", ex);
           }
         }
-        sleepUninterruptibly(TIME_BETWEEN_MIGRATION_CLEANUPS, MILLISECONDS);
+        sleepUninterruptibly(CLEANUP_INTERVAL_MINUTES, MINUTES);
       }
     }
 
@@ -735,6 +738,49 @@ public class Manager extends AbstractServer
         }
       }
     }
+  }
+
+  private class ScanServerZKCleaner implements Runnable {
+
+    @Override
+    public void run() {
+
+      final ZooReaderWriter zrw = getContext().getZooReaderWriter();
+      final String sserverZNodePath = getContext().getZooKeeperRoot() + Constants.ZSSERVERS;
+
+      while (stillManager()) {
+        try {
+          for (String sserverClientAddress : zrw.getChildren(sserverZNodePath)) {
+
+            final String sServerZPath = sserverZNodePath + "/" + sserverClientAddress;
+            final var zLockPath = ServiceLock.path(sServerZPath);
+            ZcStat stat = new ZcStat();
+            Optional<ServiceLockData> lockData =
+                ServiceLock.getLockData(getContext().getZooCache(), zLockPath, stat);
+
+            if (lockData.isEmpty()) {
+              try {
+                log.debug("Deleting empty ScanServer ZK node {}", sServerZPath);
+                zrw.delete(sServerZPath);
+              } catch (KeeperException.NotEmptyException e) {
+                log.debug(
+                    "Failed to delete ScanServer ZK node {} its not empty, likely an expected race condition.",
+                    sServerZPath);
+              }
+            }
+          }
+        } catch (KeeperException e) {
+          log.error("Exception trying to delete empty scan server ZNodes, will retry", e);
+        } catch (InterruptedException e) {
+          Thread.interrupted();
+          log.error("Interrupted trying to delete empty scan server ZNodes, will retry", e);
+        } finally {
+          // sleep for 5 mins
+          sleepUninterruptibly(CLEANUP_INTERVAL_MINUTES, MINUTES);
+        }
+      }
+    }
+
   }
 
   private class StatusThread implements Runnable {
@@ -1130,6 +1176,8 @@ public class Manager extends AbstractServer
 
     tserverSet.startListeningForTabletServerChanges();
 
+    Threads.createThread("ScanServer Cleanup Thread", new ScanServerZKCleaner()).start();
+
     try {
       blockForTservers();
     } catch (InterruptedException ex) {
@@ -1206,7 +1254,7 @@ public class Manager extends AbstractServer
               context.getZooReaderWriter()),
           HOURS.toMillis(8), System::currentTimeMillis);
 
-      Fate<Manager> f = new Fate<>(this, store, TraceRepo::toLogString, getConfiguration());
+      Fate<Manager> f = initializeFateInstance(store, getConfiguration());
       fateRef.set(f);
       fateReadyLatch.countDown();
 
@@ -1299,6 +1347,11 @@ public class Manager extends AbstractServer
       }
     }
     log.info("exiting");
+  }
+
+  protected Fate<Manager> initializeFateInstance(TStore<Manager> store,
+      AccumuloConfiguration conf) {
+    return new Fate<>(this, store, TraceRepo::toLogString, conf);
   }
 
   /**
