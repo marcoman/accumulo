@@ -38,6 +38,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
@@ -90,6 +91,7 @@ import org.apache.accumulo.core.tabletserver.thrift.NotServingTabletException;
 import org.apache.accumulo.core.util.Halt;
 import org.apache.accumulo.core.util.UtilWaitThread;
 import org.apache.accumulo.core.util.threads.ThreadPools;
+import org.apache.accumulo.core.util.time.NanoTime;
 import org.apache.accumulo.server.AbstractServer;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.client.ClientServiceHandler;
@@ -176,6 +178,7 @@ public class ScanServer extends AbstractServer
   private UUID serverLockUUID;
   private final TabletMetadataLoader tabletMetadataLoader;
   private final LoadingCache<KeyExtent,TabletMetadata> tabletMetadataCache;
+  private final ThreadPoolExecutor tmCacheExecutor;
   // tracks file reservations that are in the process of being added or removed from the metadata
   // table
   private final Set<StoredTabletFile> influxFiles = new HashSet<>();
@@ -196,7 +199,7 @@ public class ScanServer extends AbstractServer
   private final TabletServerResourceManager resourceManager;
   HostAndPort clientAddress;
 
-  private volatile boolean serverStopRequested = false;
+  protected volatile boolean serverStopRequested = false;
   private ServiceLock scanServerLock;
   protected TabletServerScanMetrics scanMetrics;
   private ScanServerMetrics scanServerMetrics;
@@ -238,14 +241,38 @@ public class ScanServer extends AbstractServer
     if (cacheExpiration == 0L) {
       LOG.warn("Tablet metadata caching disabled, may cause excessive scans on metadata table.");
       tabletMetadataCache = null;
+      tmCacheExecutor = null;
     } else {
       if (cacheExpiration < 60000) {
         LOG.warn(
             "Tablet metadata caching less than one minute, may cause excessive scans on metadata table.");
       }
-      tabletMetadataCache =
-          Caffeine.newBuilder().expireAfterWrite(cacheExpiration, TimeUnit.MILLISECONDS)
-              .scheduler(Scheduler.systemScheduler()).recordStats().build(tabletMetadataLoader);
+
+      // Get the cache refresh percentage property
+      // Value must be less than 100% as 100 or over would effectively disable it
+      double cacheRefreshPercentage =
+          getConfiguration().getFraction(Property.SSERV_CACHED_TABLET_METADATA_REFRESH_PERCENT);
+      Preconditions.checkArgument(cacheRefreshPercentage < cacheExpiration,
+          "Tablet metadata cache refresh percentage is '%s' but must be less than 1",
+          cacheRefreshPercentage);
+
+      tmCacheExecutor = context.threadPools().getPoolBuilder("scanServerTmCache").numCoreThreads(8)
+          .enableThreadPoolMetrics().build();
+      var builder = Caffeine.newBuilder().expireAfterWrite(cacheExpiration, TimeUnit.MILLISECONDS)
+          .scheduler(Scheduler.systemScheduler()).executor(tmCacheExecutor).recordStats();
+      if (cacheRefreshPercentage > 0) {
+        // Compute the refresh time as a percentage of the expiration time
+        // Cache hits after this time, but before expiration, will trigger a background
+        // non-blocking refresh of the entry so future cache hits get an updated entry
+        // without having to block for a refresh
+        long cacheRefresh = (long) (cacheExpiration * cacheRefreshPercentage);
+        LOG.debug("Tablet metadata refresh percentage set to {}, refresh time set to {} ms",
+            cacheRefreshPercentage, cacheRefresh);
+        builder.refreshAfterWrite(cacheRefresh, TimeUnit.MILLISECONDS);
+      } else {
+        LOG.warn("Tablet metadata cache refresh disabled, may cause blocking on cache expiration.");
+      }
+      tabletMetadataCache = builder.build(tabletMetadataLoader);
     }
 
     delegate = newThriftScanClientHandler(new WriteTracker());
@@ -402,7 +429,7 @@ public class ScanServer extends AbstractServer
       address.server.stop();
 
       LOG.info("Removing server scan references");
-      this.getContext().getAmple().deleteScanServerFileReferences(clientAddress.toString(),
+      this.getContext().getAmple().scanServerRefs().delete(clientAddress.toString(),
           serverLockUUID);
 
       try {
@@ -413,6 +440,11 @@ public class ScanServer extends AbstractServer
         }
       } catch (IOException e) {
         LOG.warn("Failed to close filesystem : {}", e.getMessage(), e);
+      }
+
+      if (tmCacheExecutor != null) {
+        LOG.debug("Shutting down TabletMetadataCache executor");
+        tmCacheExecutor.shutdownNow();
       }
 
       context.getLowMemoryDetector().logGCInfo(getConfiguration());
@@ -605,7 +637,8 @@ public class ScanServer extends AbstractServer
       }
 
       if (!filesToReserve.isEmpty()) {
-        getContext().getAmple().putScanServerFileReferences(refs);
+        scanServerMetrics.recordWriteOutReservationTime(
+            () -> getContext().getAmple().scanServerRefs().put(refs));
 
         // After we insert the scan server refs we need to check and see if the tablet is still
         // using the file. As long as the tablet is still using the files then the Accumulo GC
@@ -638,7 +671,8 @@ public class ScanServer extends AbstractServer
         if (!filesToReserve.isEmpty()) {
           LOG.info("RFFS {} tablet files changed while attempting to reference files {}",
               myReservationId, filesToReserve);
-          getContext().getAmple().deleteScanServerFileReferences(refs);
+          getContext().getAmple().scanServerRefs().delete(refs);
+          scanServerMetrics.incrementReservationConflictCount();
           return null;
         }
       }
@@ -669,12 +703,11 @@ public class ScanServer extends AbstractServer
   @VisibleForTesting
   ScanReservation reserveFilesInstrumented(Map<KeyExtent,List<TRange>> extents)
       throws AccumuloException {
-    long start = System.nanoTime();
+    NanoTime start = NanoTime.now();
     try {
       return reserveFiles(extents);
     } finally {
-      scanServerMetrics.getReservationTimer().record(System.nanoTime() - start,
-          TimeUnit.NANOSECONDS);
+      scanServerMetrics.recordTotalReservationTime(start.elapsed());
     }
 
   }
@@ -711,12 +744,11 @@ public class ScanServer extends AbstractServer
 
   @VisibleForTesting
   ScanReservation reserveFilesInstrumented(long scanId) throws NoSuchScanIDException {
-    long start = System.nanoTime();
+    NanoTime start = NanoTime.now();
     try {
       return reserveFiles(scanId);
     } finally {
-      scanServerMetrics.getReservationTimer().record(System.nanoTime() - start,
-          TimeUnit.NANOSECONDS);
+      scanServerMetrics.recordTotalReservationTime(start.elapsed());
     }
   }
 
@@ -816,7 +848,7 @@ public class ScanServer extends AbstractServer
       if (!confirmed.isEmpty()) {
         try {
           // Do this metadata operation is done w/o holding the lock
-          getContext().getAmple().deleteScanServerFileReferences(refsToDelete);
+          getContext().getAmple().scanServerRefs().delete(refsToDelete);
           if (LOG.isTraceEnabled()) {
             confirmed.forEach(refToDelete -> LOG.trace(
                 "RFFS referenced files has not been used recently, removing reference {}",
@@ -897,6 +929,11 @@ public class ScanServer extends AbstractServer
     };
   }
 
+  /* Exposed for testing */
+  protected boolean isSystemUser(TCredentials creds) {
+    return context.getSecurityOperation().isSystemUser(creds);
+  }
+
   @Override
   public InitialScan startScan(TInfo tinfo, TCredentials credentials, TKeyExtent textent,
       TRange range, List<TColumn> columns, int batchSize, List<IterInfo> ssiList,
@@ -907,6 +944,12 @@ public class ScanServer extends AbstractServer
       TooManyFilesException, TSampleNotPresentException, TException {
 
     KeyExtent extent = getKeyExtent(textent);
+
+    if (extent.isSystemTable() && !isSystemUser(credentials)) {
+      throw new TException(
+          "Only the system user can perform eventual consistency scans on the root and metadata tables");
+    }
+
     try (ScanReservation reservation =
         reserveFilesInstrumented(Map.of(extent, Collections.singletonList(range)))) {
 
@@ -968,6 +1011,12 @@ public class ScanServer extends AbstractServer
 
     for (Entry<TKeyExtent,List<TRange>> entry : tbatch.entrySet()) {
       KeyExtent extent = getKeyExtent(entry.getKey());
+
+      if (extent.isSystemTable() && !isSystemUser(credentials)) {
+        throw new TException(
+            "Only the system user can perform eventual consistency scans on the root and metadata tables");
+      }
+
       batch.put(extent, entry.getValue());
     }
 
