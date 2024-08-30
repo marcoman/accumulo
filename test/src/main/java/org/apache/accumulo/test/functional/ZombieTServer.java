@@ -50,7 +50,6 @@ import org.apache.accumulo.server.rpc.ServerAddress;
 import org.apache.accumulo.server.rpc.TServerUtils;
 import org.apache.accumulo.server.rpc.ThriftProcessorTypes;
 import org.apache.accumulo.server.rpc.ThriftServerType;
-import org.apache.accumulo.server.zookeeper.TransactionWatcher;
 import org.apache.thrift.TMultiplexedProcessor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -110,8 +109,7 @@ public class ZombieTServer {
   public static void main(String[] args) throws Exception {
     int port = RANDOM.get().nextInt(30000) + 2000;
     var context = new ServerContext(SiteConfiguration.auto());
-    final ClientServiceHandler csh =
-        new ClientServiceHandler(context, new TransactionWatcher(context));
+    final ClientServiceHandler csh = new ClientServiceHandler(context);
     final ZombieTServerThriftClientHandler tch = new ZombieTServerThriftClientHandler();
 
     TMultiplexedProcessor muxProcessor = new TMultiplexedProcessor();
@@ -141,7 +139,8 @@ public class ZombieTServer {
     ServiceLock zlock = new ServiceLock(zoo.getZooKeeper(), zLockPath, UUID.randomUUID());
 
     MetricsInfo metricsInfo = context.getMetricsInfo();
-    metricsInfo.addServiceTags("zombie.server", serverPort.address);
+    metricsInfo.addServiceTags("zombie.server", serverPort.address,
+        Constants.DEFAULT_RESOURCE_GROUP_NAME);
     metricsInfo.init();
 
     LockWatcher lw = new LockWatcher() {
@@ -172,7 +171,7 @@ public class ZombieTServer {
     };
 
     if (zlock.tryLock(lw, new ServiceLockData(UUID.randomUUID(), addressString, ThriftService.TSERV,
-        ServiceLockData.ServiceDescriptor.DEFAULT_GROUP_NAME))) {
+        Constants.DEFAULT_RESOURCE_GROUP_NAME))) {
       log.debug("Obtained tablet server lock {}", zlock.getLockPath());
     }
     // modify metadata

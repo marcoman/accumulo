@@ -19,6 +19,7 @@
 package org.apache.accumulo.tserver;
 
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
+import static org.apache.accumulo.core.util.threads.ThreadPoolNames.SCAN_SERVER_TABLET_METADATA_CACHE_POOL;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -53,6 +54,7 @@ import org.apache.accumulo.core.clientImpl.thrift.TInfo;
 import org.apache.accumulo.core.clientImpl.thrift.ThriftSecurityException;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
 import org.apache.accumulo.core.conf.Property;
+import org.apache.accumulo.core.conf.SiteConfiguration;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
 import org.apache.accumulo.core.dataImpl.thrift.InitialMultiScan;
 import org.apache.accumulo.core.dataImpl.thrift.InitialScan;
@@ -89,9 +91,10 @@ import org.apache.accumulo.core.tabletscan.thrift.TooManyFilesException;
 import org.apache.accumulo.core.tabletserver.thrift.NoSuchScanIDException;
 import org.apache.accumulo.core.tabletserver.thrift.NotServingTabletException;
 import org.apache.accumulo.core.util.Halt;
+import org.apache.accumulo.core.util.Timer;
 import org.apache.accumulo.core.util.UtilWaitThread;
+import org.apache.accumulo.core.util.cache.Caches.CacheName;
 import org.apache.accumulo.core.util.threads.ThreadPools;
-import org.apache.accumulo.core.util.time.NanoTime;
 import org.apache.accumulo.server.AbstractServer;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.client.ClientServiceHandler;
@@ -102,8 +105,8 @@ import org.apache.accumulo.server.rpc.ServerAddress;
 import org.apache.accumulo.server.rpc.TServerUtils;
 import org.apache.accumulo.server.rpc.ThriftProcessorTypes;
 import org.apache.accumulo.server.security.SecurityUtil;
-import org.apache.accumulo.server.zookeeper.TransactionWatcher;
 import org.apache.accumulo.tserver.TabletServerResourceManager.TabletResourceManager;
+import org.apache.accumulo.tserver.log.LogSorter;
 import org.apache.accumulo.tserver.metrics.TabletServerScanMetrics;
 import org.apache.accumulo.tserver.session.MultiScanSession;
 import org.apache.accumulo.tserver.session.ScanSession;
@@ -122,15 +125,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.github.benmanes.caffeine.cache.CacheLoader;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.github.benmanes.caffeine.cache.Scheduler;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Sets;
 import com.google.common.net.HostAndPort;
-
-import io.micrometer.core.instrument.Tag;
 
 public class ScanServer extends AbstractServer
     implements TabletScanClientService.Iface, TabletHostingServer {
@@ -205,12 +205,10 @@ public class ScanServer extends AbstractServer
   private ScanServerMetrics scanServerMetrics;
   private BlockCacheMetrics blockCacheMetrics;
 
-  private ZooCache managerLockCache;
-
-  private final String groupName;
+  private final ZooCache managerLockCache;
 
   public ScanServer(ConfigOpts opts, String[] args) {
-    super("sserver", opts, args);
+    super("sserver", opts, ServerContext::new, args);
 
     context = super.getContext();
     log.info("Version " + Constants.VERSION);
@@ -234,7 +232,7 @@ public class ScanServer extends AbstractServer
         getConfiguration().getTimeInMillis(Property.SSERV_CACHED_TABLET_METADATA_EXPIRATION);
 
     long scanServerReservationExpiration =
-        getConfiguration().getTimeInMillis(Property.SSERVER_SCAN_REFERENCE_EXPIRATION_TIME);
+        getConfiguration().getTimeInMillis(Property.SSERV_SCAN_REFERENCE_EXPIRATION_TIME);
 
     tabletMetadataLoader = new TabletMetadataLoader(getContext().getAmple());
 
@@ -256,10 +254,12 @@ public class ScanServer extends AbstractServer
           "Tablet metadata cache refresh percentage is '%s' but must be less than 1",
           cacheRefreshPercentage);
 
-      tmCacheExecutor = context.threadPools().getPoolBuilder("scanServerTmCache").numCoreThreads(8)
-          .enableThreadPoolMetrics().build();
-      var builder = Caffeine.newBuilder().expireAfterWrite(cacheExpiration, TimeUnit.MILLISECONDS)
-          .scheduler(Scheduler.systemScheduler()).executor(tmCacheExecutor).recordStats();
+      tmCacheExecutor = context.threadPools().getPoolBuilder(SCAN_SERVER_TABLET_METADATA_CACHE_POOL)
+          .numCoreThreads(8).enableThreadPoolMetrics().build();
+      var builder =
+          context.getCaches().createNewBuilder(CacheName.SCAN_SERVER_TABLET_METADATA, true)
+              .expireAfterWrite(cacheExpiration, TimeUnit.MILLISECONDS)
+              .scheduler(Scheduler.systemScheduler()).executor(tmCacheExecutor).recordStats();
       if (cacheRefreshPercentage > 0) {
         // Compute the refresh time as a percentage of the expiration time
         // Cache hits after this time, but before expiration, will trigger a background
@@ -277,13 +277,16 @@ public class ScanServer extends AbstractServer
 
     delegate = newThriftScanClientHandler(new WriteTracker());
 
-    this.groupName = getConfiguration().get(Property.SSERV_GROUP_NAME);
-
     ThreadPools.watchCriticalScheduledTask(getContext().getScheduledExecutor()
         .scheduleWithFixedDelay(() -> cleanUpReservedFiles(scanServerReservationExpiration),
             scanServerReservationExpiration, scanServerReservationExpiration,
             TimeUnit.MILLISECONDS));
 
+  }
+
+  @Override
+  protected String getResourceGroupPropertyValue(SiteConfiguration conf) {
+    return conf.get(Property.SSERV_GROUP_NAME);
   }
 
   @VisibleForTesting
@@ -301,18 +304,14 @@ public class ScanServer extends AbstractServer
 
     // This class implements TabletClientService.Iface and then delegates calls. Be sure
     // to set up the ThriftProcessor using this class, not the delegate.
-    ClientServiceHandler clientHandler =
-        new ClientServiceHandler(context, new TransactionWatcher(context));
+    ClientServiceHandler clientHandler = new ClientServiceHandler(context);
     TProcessor processor =
         ThriftProcessorTypes.getScanServerTProcessor(clientHandler, this, getContext());
 
-    Property maxMessageSizeProperty =
-        (getConfiguration().get(Property.SSERV_MAX_MESSAGE_SIZE) != null
-            ? Property.SSERV_MAX_MESSAGE_SIZE : Property.GENERAL_MAX_MESSAGE_SIZE);
     ServerAddress sp = TServerUtils.startServer(getContext(), getHostname(),
         Property.SSERV_CLIENTPORT, processor, this.getClass().getSimpleName(),
         "Thrift Client Server", Property.SSERV_PORTSEARCH, Property.SSERV_MINTHREADS,
-        Property.SSERV_MINTHREADS_TIMEOUT, Property.SSERV_THREADCHECK, maxMessageSizeProperty);
+        Property.SSERV_MINTHREADS_TIMEOUT, Property.SSERV_THREADCHECK);
 
     LOG.info("address = {}", sp.address);
     return sp;
@@ -373,8 +372,8 @@ public class ScanServer extends AbstractServer
         ServiceDescriptors descriptors = new ServiceDescriptors();
         for (ThriftService svc : new ThriftService[] {ThriftService.CLIENT,
             ThriftService.TABLET_SCAN}) {
-          descriptors.addService(
-              new ServiceDescriptor(serverLockUUID, svc, getClientAddressString(), this.groupName));
+          descriptors.addService(new ServiceDescriptor(serverLockUUID, svc,
+              getClientAddressString(), this.getResourceGroup()));
         }
 
         if (scanServerLock.tryLock(lw, new ServiceLockData(descriptors))) {
@@ -406,10 +405,10 @@ public class ScanServer extends AbstractServer
     }
 
     MetricsInfo metricsInfo = getContext().getMetricsInfo();
-    metricsInfo.addServiceTags(getApplicationName(), clientAddress);
-    metricsInfo.addCommonTags(List.of(Tag.of("resource.group", groupName)));
+    metricsInfo.addServiceTags(getApplicationName(), clientAddress, getResourceGroup());
 
     scanMetrics = new TabletServerScanMetrics();
+    sessionManager.setZombieCountConsumer(scanMetrics::setZombieScanThreads);
     scanServerMetrics = new ScanServerMetrics(tabletMetadataCache);
     blockCacheMetrics = new BlockCacheMetrics(resourceManager.getIndexCache(),
         resourceManager.getDataCache(), resourceManager.getSummaryCache());
@@ -419,10 +418,29 @@ public class ScanServer extends AbstractServer
     // We need to set the compaction manager so that we don't get an NPE in CompactableImpl.close
 
     ServiceLock lock = announceExistence();
+    this.getContext().setServiceLock(lock);
+
+    int threadPoolSize = getConfiguration().getCount(Property.SSERV_WAL_SORT_MAX_CONCURRENT);
+    if (threadPoolSize > 0) {
+      final LogSorter logSorter = new LogSorter(context, getConfiguration());
+      try {
+        // Attempt to process all existing log sorting work and start a background
+        // thread to look for log sorting work in the future
+        logSorter.startWatchingForRecoveryLogs(threadPoolSize);
+      } catch (Exception ex) {
+        log.error("Error starting LogSorter");
+        throw new RuntimeException(ex);
+      }
+    } else {
+      log.info(
+          "Log sorting for tablet recovery is disabled, SSERV_WAL_SORT_MAX_CONCURRENT is less than 1.");
+    }
 
     try {
       while (!serverStopRequested) {
         UtilWaitThread.sleep(1000);
+        updateIdleStatus(
+            sessionManager.getActiveScans().isEmpty() && tabletMetadataCache.estimatedSize() == 0);
       }
     } finally {
       LOG.info("Stopping Thrift Servers");
@@ -628,8 +646,8 @@ public class ScanServer extends AbstractServer
 
       for (StoredTabletFile file : allFiles.keySet()) {
         if (!reservedFiles.containsKey(file)) {
-          refs.add(new ScanServerRefTabletFile(file.getNormalizedPathStr(), serverAddress,
-              serverLockUUID));
+          refs.add(new ScanServerRefTabletFile(serverLockUUID, serverAddress,
+              file.getNormalizedPathStr()));
           filesToReserve.add(file);
           tabletsToCheck.add(Objects.requireNonNull(allFiles.get(file)));
           LOG.trace("RFFS {} need to add scan ref for file {}", myReservationId, file);
@@ -703,7 +721,7 @@ public class ScanServer extends AbstractServer
   @VisibleForTesting
   ScanReservation reserveFilesInstrumented(Map<KeyExtent,List<TRange>> extents)
       throws AccumuloException {
-    NanoTime start = NanoTime.now();
+    Timer start = Timer.startNew();
     try {
       return reserveFiles(extents);
     } finally {
@@ -744,7 +762,7 @@ public class ScanServer extends AbstractServer
 
   @VisibleForTesting
   ScanReservation reserveFilesInstrumented(long scanId) throws NoSuchScanIDException {
-    NanoTime start = NanoTime.now();
+    Timer start = Timer.startNew();
     try {
       return reserveFiles(scanId);
     } finally {
@@ -790,7 +808,7 @@ public class ScanServer extends AbstractServer
     return new ScanReservation(scanSessionFiles, myReservationId);
   }
 
-  private static Set<StoredTabletFile> getScanSessionFiles(ScanSession session) {
+  private static Set<StoredTabletFile> getScanSessionFiles(ScanSession<?> session) {
     if (session instanceof SingleScanSession) {
       var sss = (SingleScanSession) session;
       return Set.copyOf(session.getTabletResolver().getTablet(sss.extent).getDatafiles().keySet());

@@ -46,6 +46,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -53,10 +54,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.apache.accumulo.cluster.AccumuloCluster;
@@ -65,22 +67,38 @@ import org.apache.accumulo.core.client.Accumulo;
 import org.apache.accumulo.core.client.AccumuloClient;
 import org.apache.accumulo.core.client.AccumuloException;
 import org.apache.accumulo.core.client.AccumuloSecurityException;
+import org.apache.accumulo.core.client.TableNotFoundException;
 import org.apache.accumulo.core.client.security.tokens.AuthenticationToken;
 import org.apache.accumulo.core.clientImpl.ClientContext;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
 import org.apache.accumulo.core.conf.ClientProperty;
 import org.apache.accumulo.core.conf.ConfigurationCopy;
+import org.apache.accumulo.core.conf.ConfigurationTypeHelper;
 import org.apache.accumulo.core.conf.DefaultConfiguration;
 import org.apache.accumulo.core.conf.Property;
 import org.apache.accumulo.core.conf.SiteConfiguration;
 import org.apache.accumulo.core.data.InstanceId;
+import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
+import org.apache.accumulo.core.fate.zookeeper.ZooSession;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil;
+import org.apache.accumulo.core.lock.ServiceLock;
+import org.apache.accumulo.core.lock.ServiceLock.AccumuloLockWatcher;
+import org.apache.accumulo.core.lock.ServiceLock.LockLossReason;
+import org.apache.accumulo.core.lock.ServiceLock.ServiceLockPath;
+import org.apache.accumulo.core.lock.ServiceLockData;
+import org.apache.accumulo.core.lock.ServiceLockData.ThriftService;
 import org.apache.accumulo.core.manager.thrift.ManagerGoalState;
 import org.apache.accumulo.core.manager.thrift.ManagerMonitorInfo;
 import org.apache.accumulo.core.rpc.clients.ThriftClientTypes;
+import org.apache.accumulo.core.spi.common.ServiceEnvironment;
+import org.apache.accumulo.core.spi.compaction.CompactionPlanner;
+import org.apache.accumulo.core.spi.compaction.CompactionServiceId;
 import org.apache.accumulo.core.trace.TraceUtil;
+import org.apache.accumulo.core.util.ConfigurationImpl;
 import org.apache.accumulo.core.util.Pair;
+import org.apache.accumulo.core.util.compaction.CompactionPlannerInitParams;
+import org.apache.accumulo.core.util.compaction.CompactionServicesConfig;
 import org.apache.accumulo.manager.state.SetGoalState;
 import org.apache.accumulo.minicluster.MiniAccumuloCluster;
 import org.apache.accumulo.minicluster.ServerType;
@@ -100,11 +118,9 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
+import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.KeeperException.Code;
-import org.apache.zookeeper.ZKUtil;
 import org.apache.zookeeper.ZooKeeper;
-import org.apache.zookeeper.ZooKeeper.States;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -138,6 +154,9 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
 
   private boolean initialized = false;
   private ExecutorService executor;
+  private ServiceLock miniLock;
+  private ZooKeeper zk;
+  private AccumuloClient client;
 
   /**
    *
@@ -154,6 +173,13 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
    * @param config initial configuration
    */
   public MiniAccumuloClusterImpl(MiniAccumuloConfigImpl config) throws IOException {
+
+    // Set the TabletGroupWatcher interval to 5s for all MAC instances unless set by
+    // the test.
+    if (!config.getSiteConfig()
+        .containsKey(Property.MANAGER_TABLET_GROUP_WATCHER_INTERVAL.getKey())) {
+      config.setProperty(Property.MANAGER_TABLET_GROUP_WATCHER_INTERVAL, "5s");
+    }
 
     this.config = config.initialize();
     this.clientProperties = Suppliers.memoize(
@@ -238,7 +264,17 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
     File siteFile = new File(config.getConfDir(), "accumulo.properties");
     writeConfigProperties(siteFile, config.getSiteConfig());
     this.siteConfig = SiteConfiguration.fromFile(siteFile).build();
-    this.context = Suppliers.memoize(() -> new ServerContext(siteConfig));
+    this.context = Suppliers.memoize(() -> new ServerContext(siteConfig) {
+
+      @Override
+      public ServiceLock getServiceLock() {
+        // Override getServiceLock because any call to setServiceLock
+        // will set the SingletonManager.MODE to SERVER and we may not
+        // want that side-effect.
+        return miniLock;
+      }
+
+    });
 
     if (!config.useExistingInstance() && !config.useExistingZooKeepers()) {
       zooCfgFile = new File(config.getConfDir(), "zoo.cfg");
@@ -542,7 +578,7 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
               s.getOutputStream().flush();
               byte[] buffer = new byte[100];
               int n = s.getInputStream().read(buffer);
-              if (n >= 4 && new String(buffer, 0, 4).equals("imok")) {
+              if (n >= 4 && new String(buffer, 0, 4, UTF_8).equals("imok")) {
                 break;
               }
             } catch (IOException | RuntimeException e) {
@@ -589,6 +625,7 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
         config.getZooKeepers());
 
     control.start(ServerType.TABLET_SERVER);
+    control.start(ServerType.SCAN_SERVER);
 
     int ret = 0;
     for (int i = 0; i < 5; i++) {
@@ -611,8 +648,166 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
       executor = Executors.newSingleThreadExecutor();
     }
 
-    verifyUp();
+    Set<String> groups;
+    try {
+      groups = getCompactionGroupNames();
+      if (groups.isEmpty()) {
+        throw new IllegalStateException("No Compactor groups configured.");
+      }
+      for (String name : groups) {
+        // Allow user override
+        if (!config.getClusterServerConfiguration().getCompactorConfiguration().containsKey(name)) {
+          config.getClusterServerConfiguration().addCompactorResourceGroup(name, 1);
+        }
+      }
+    } catch (ClassNotFoundException e) {
+      throw new IllegalArgumentException("Unable to find declared CompactionPlanner class", e);
+    }
+    control.start(ServerType.COMPACTOR);
 
+    final AtomicBoolean lockAcquired = new AtomicBoolean(false);
+    final CountDownLatch lockWatcherInvoked = new CountDownLatch(1);
+    AccumuloLockWatcher miniLockWatcher = new AccumuloLockWatcher() {
+
+      @Override
+      public void lostLock(LockLossReason reason) {
+        log.warn("Lost lock: " + reason.toString());
+        miniLock = null;
+      }
+
+      @Override
+      public void unableToMonitorLockNode(Exception e) {
+        log.warn("Unable to monitor lock: " + e.getMessage());
+        miniLock = null;
+      }
+
+      @Override
+      public void acquiredLock() {
+        log.warn("Acquired ZK lock for MiniAccumuloClusterImpl");
+        lockAcquired.set(true);
+        lockWatcherInvoked.countDown();
+      }
+
+      @Override
+      public void failedToAcquireLock(Exception e) {
+        log.warn("Failed to acquire ZK lock for MiniAccumuloClusterImpl, msg: " + e.getMessage());
+        lockWatcherInvoked.countDown();
+        miniLock = null;
+      }
+    };
+
+    InstanceId iid = null;
+    // It's possible start was called twice...
+    if (client == null) {
+      client = Accumulo.newClient().from(getClientProperties()).build();
+    }
+    iid = client.instanceOperations().getInstanceId();
+    // The code below does not use `getServerContext()` as that will
+    // set the SingletonManager.mode to SERVER which will cause some
+    // tests to fail
+    final Map<String,String> properties = config.getSiteConfig();
+    final int timeout = (int) ConfigurationTypeHelper.getTimeInMillis(properties.getOrDefault(
+        Property.INSTANCE_ZK_TIMEOUT.getKey(), Property.INSTANCE_ZK_TIMEOUT.getDefaultValue()));
+    final String secret = properties.get(Property.INSTANCE_SECRET.getKey());
+    final byte[] auth = ("accumulo:" + secret).getBytes(UTF_8);
+    zk = ZooSession.getAuthenticatedSession(config.getZooKeepers(), timeout, "digest", auth);
+
+    // It's possible start was called twice...
+    if (miniLock == null) {
+      String zooKeeperRoot = ZooUtil.getRoot(iid);
+      UUID miniUUID = UUID.randomUUID();
+      String miniZDirPath = zooKeeperRoot + "/mini";
+      String miniZInstancePath = miniZDirPath + "/" + miniUUID.toString();
+      try {
+        if (zk.exists(miniZDirPath, null) == null) {
+          zk.create(miniZDirPath, new byte[0], ZooUtil.PUBLIC, CreateMode.PERSISTENT);
+          log.info("Created: {}", miniZDirPath);
+        }
+        if (zk.exists(miniZInstancePath, null) == null) {
+          zk.create(miniZInstancePath, new byte[0], ZooUtil.PUBLIC, CreateMode.PERSISTENT);
+          log.info("Created: {}", miniZInstancePath);
+        }
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException("Error creating path in ZooKeeper", e);
+      }
+      ServiceLockPath path = ServiceLock.path(miniZInstancePath);
+      ServiceLockData sld = new ServiceLockData(miniUUID, "localhost", ThriftService.NONE,
+          Constants.DEFAULT_RESOURCE_GROUP_NAME);
+      miniLock = new ServiceLock(zk, path, miniUUID);
+      miniLock.lock(miniLockWatcher, sld);
+
+      lockWatcherInvoked.await();
+
+      if (!lockAcquired.get()) {
+        throw new IllegalStateException("Error creating MAC entry in ZooKeeper");
+      }
+    }
+
+    verifyUp(iid);
+
+    printProcessSummary();
+
+  }
+
+  private void printProcessSummary() {
+    log.info("Process Summary:");
+    getProcesses().forEach((k, v) -> log.info("{}: {}", k,
+        v.stream().map((pr) -> pr.getProcess().pid()).collect(Collectors.toList())));
+  }
+
+  private Set<String> getCompactionGroupNames() throws ClassNotFoundException {
+
+    Set<String> groupNames = new HashSet<>();
+    AccumuloConfiguration aconf = new ConfigurationCopy(config.getSiteConfig());
+    CompactionServicesConfig csc = new CompactionServicesConfig(aconf);
+
+    ServiceEnvironment senv = new ServiceEnvironment() {
+
+      @Override
+      public String getTableName(TableId tableId) throws TableNotFoundException {
+        return null;
+      }
+
+      @Override
+      public <T> T instantiate(String className, Class<T> base)
+          throws ReflectiveOperationException {
+        return ConfigurationTypeHelper.getClassInstance(null, className, base);
+      }
+
+      @Override
+      public <T> T instantiate(TableId tableId, String className, Class<T> base)
+          throws ReflectiveOperationException {
+        return null;
+      }
+
+      @Override
+      public Configuration getConfiguration() {
+        return new ConfigurationImpl(aconf);
+      }
+
+      @Override
+      public Configuration getConfiguration(TableId tableId) {
+        return null;
+      }
+
+    };
+
+    for (var entry : csc.getPlanners().entrySet()) {
+      String serviceId = entry.getKey();
+      String plannerClass = entry.getValue();
+
+      try {
+        CompactionPlanner cp = senv.instantiate(plannerClass, CompactionPlanner.class);
+        var initParams = new CompactionPlannerInitParams(CompactionServiceId.of(serviceId),
+            csc.getPlannerPrefix(serviceId), csc.getOptions().get(serviceId), senv);
+        cp.init(initParams);
+        initParams.getRequestedGroups().forEach(gid -> groupNames.add(gid.canonical()));
+      } catch (Exception e) {
+        log.error("For compaction service {}, failed to get compactor groups from planner {}.",
+            serviceId, plannerClass, e);
+      }
+    }
+    return groupNames;
   }
 
   // wait up to 10 seconds for the process to start
@@ -627,9 +822,7 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
     }
   }
 
-  private void verifyUp() throws InterruptedException, IOException {
-
-    int numTries = 10;
+  private void verifyUp(InstanceId instanceId) throws InterruptedException, IOException {
 
     requireNonNull(getClusterControl().managerProcess, "Error starting Manager - no process");
     waitForProcessStart(getClusterControl().managerProcess, "Manager");
@@ -638,111 +831,86 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
     waitForProcessStart(getClusterControl().gcProcess, "GC");
 
     int tsExpectedCount = 0;
-    for (Process tsp : getClusterControl().tabletServerProcesses) {
-      tsExpectedCount++;
-      requireNonNull(tsp, "Error starting TabletServer " + tsExpectedCount + " - no process");
-      waitForProcessStart(tsp, "TabletServer" + tsExpectedCount);
+    for (List<Process> tabletServerProcesses : getClusterControl().tabletServerProcesses.values()) {
+      for (Process tsp : tabletServerProcesses) {
+        tsExpectedCount++;
+        requireNonNull(tsp, "Error starting TabletServer " + tsExpectedCount + " - no process");
+        waitForProcessStart(tsp, "TabletServer" + tsExpectedCount);
+      }
     }
 
-    try (ZooKeeper zk = new ZooKeeper(getZooKeepers(), 60000, event -> log.warn("{}", event))) {
-
-      String secret = getSiteConfiguration().get(Property.INSTANCE_SECRET);
-
-      while (!(zk.getState() == States.CONNECTED)) {
-        log.info("Waiting for ZK client to connect, state: {} - will retry", zk.getState());
-        Thread.sleep(1000);
+    int ssExpectedCount = 0;
+    for (List<Process> scanServerProcesses : getClusterControl().scanServerProcesses.values()) {
+      for (Process tsp : scanServerProcesses) {
+        ssExpectedCount++;
+        requireNonNull(tsp, "Error starting ScanServer " + ssExpectedCount + " - no process");
+        waitForProcessStart(tsp, "ScanServer" + ssExpectedCount);
       }
-
-      String instanceId = null;
-      for (int i = 0; i < numTries; i++) {
-        if (zk.getState() == States.CONNECTED) {
-          ZooUtil.digestAuth(zk, secret);
-          try {
-            final AtomicInteger rc = new AtomicInteger();
-            final CountDownLatch waiter = new CountDownLatch(1);
-            zk.sync("/", (code, arg1, arg2) -> {
-              rc.set(code);
-              waiter.countDown();
-            }, null);
-            waiter.await();
-            Code code = Code.get(rc.get());
-            if (code != Code.OK) {
-              throw KeeperException.create(code);
-            }
-            String instanceNamePath =
-                Constants.ZROOT + Constants.ZINSTANCES + "/" + config.getInstanceName();
-            byte[] bytes = zk.getData(instanceNamePath, null, null);
-            instanceId = new String(bytes, UTF_8);
-            break;
-          } catch (KeeperException e) {
-            log.warn("Error trying to read instance id from zookeeper: " + e.getMessage());
-            log.debug("Unable to read instance id from zookeeper.", e);
-          }
-        } else {
-          log.warn("ZK client not connected, state: {}", zk.getState());
-        }
-        Thread.sleep(1000);
-      }
-
-      if (instanceId == null) {
-        for (int i = 0; i < numTries; i++) {
-          if (zk.getState() == States.CONNECTED) {
-            ZooUtil.digestAuth(zk, secret);
-            try {
-              log.warn("******* COULD NOT FIND INSTANCE ID - DUMPING ZK ************");
-              log.warn("Connected to ZooKeeper: {}", getZooKeepers());
-              log.warn("Looking for instanceId at {}",
-                  Constants.ZROOT + Constants.ZINSTANCES + "/" + config.getInstanceName());
-              ZKUtil.visitSubTreeDFS(zk, Constants.ZROOT, false,
-                  (rc, path, ctx, name) -> log.warn("{}", path));
-              log.warn("******* END ZK DUMP ************");
-            } catch (KeeperException | InterruptedException e) {
-              log.error("Error dumping zk", e);
-            }
-          }
-          Thread.sleep(1000);
-        }
-        throw new IllegalStateException("Unable to find instance id from zookeeper.");
-      }
-
-      String rootPath = Constants.ZROOT + "/" + instanceId;
-      int tsActualCount = 0;
-      try {
-        while (tsActualCount < tsExpectedCount) {
-          tsActualCount = 0;
-          for (String child : zk.getChildren(rootPath + Constants.ZTSERVERS, null)) {
-            if (zk.getChildren(rootPath + Constants.ZTSERVERS + "/" + child, null).isEmpty()) {
-              log.info("TServer " + tsActualCount + " not yet present in ZooKeeper");
-            } else {
-              tsActualCount++;
-              log.info("TServer " + tsActualCount + " present in ZooKeeper");
-            }
-          }
-          Thread.sleep(500);
-        }
-      } catch (KeeperException e) {
-        throw new IllegalStateException("Unable to read TServer information from zookeeper.", e);
-      }
-
-      try {
-        while (zk.getChildren(rootPath + Constants.ZMANAGER_LOCK, null).isEmpty()) {
-          log.info("Manager not yet present in ZooKeeper");
-          Thread.sleep(500);
-        }
-      } catch (KeeperException e) {
-        throw new IllegalStateException("Unable to read Manager information from zookeeper.", e);
-      }
-
-      try {
-        while (zk.getChildren(rootPath + Constants.ZGC_LOCK, null).isEmpty()) {
-          log.info("GC not yet present in ZooKeeper");
-          Thread.sleep(500);
-        }
-      } catch (KeeperException e) {
-        throw new IllegalStateException("Unable to read GC information from zookeeper.", e);
-      }
-
     }
+
+    int ecExpectedCount = 0;
+    for (List<Process> compactorProcesses : getClusterControl().compactorProcesses.values()) {
+      for (Process ecp : compactorProcesses) {
+        ecExpectedCount++;
+        requireNonNull(ecp, "Error starting compactor " + ecExpectedCount + " - no process");
+        waitForProcessStart(ecp, "Compactor" + ecExpectedCount);
+      }
+    }
+
+    final String rootPath = ZooUtil.getRoot(instanceId);
+    int tsActualCount = 0;
+    try {
+      while (tsActualCount < ssExpectedCount) {
+        tsActualCount = 0;
+        for (String child : zk.getChildren(rootPath + Constants.ZTSERVERS, null)) {
+          if (zk.getChildren(rootPath + Constants.ZTSERVERS + "/" + child, null).isEmpty()) {
+            log.info("TServer " + tsActualCount + " not yet present in ZooKeeper");
+          } else {
+            tsActualCount++;
+            log.info("TServer " + tsActualCount + " present in ZooKeeper");
+          }
+        }
+        Thread.sleep(500);
+      }
+    } catch (KeeperException e) {
+      throw new IllegalStateException("Unable to read TServer information from zookeeper.", e);
+    }
+
+    int ecActualCount = 0;
+    try {
+      while (ecActualCount < ecExpectedCount) {
+        ecActualCount = 0;
+        for (String queue : zk.getChildren(rootPath + Constants.ZCOMPACTORS, null)) {
+          var qc = zk.getChildren(rootPath + Constants.ZCOMPACTORS + "/" + queue, null);
+          if (qc != null) {
+            ecActualCount += qc.size();
+          }
+        }
+        log.info("Compactor " + ecActualCount + " of " + ecExpectedCount + " present in ZooKeeper");
+        Thread.sleep(500);
+      }
+    } catch (KeeperException e) {
+      throw new IllegalStateException("Unable to read Compactor information from zookeeper.", e);
+    }
+
+    try {
+      while (zk.getChildren(rootPath + Constants.ZMANAGER_LOCK, null).isEmpty()) {
+        log.info("Manager not yet present in ZooKeeper");
+        Thread.sleep(500);
+      }
+    } catch (KeeperException e) {
+      throw new IllegalStateException("Unable to read Manager information from zookeeper.", e);
+    }
+
+    try {
+      while (zk.getChildren(rootPath + Constants.ZGC_LOCK, null).isEmpty()) {
+        log.info("GC not yet present in ZooKeeper");
+        Thread.sleep(500);
+      }
+    } catch (KeeperException e) {
+      throw new IllegalStateException("Unable to read GC information from zookeeper.", e);
+    }
+
   }
 
   private List<String> buildRemoteDebugParams(int port) {
@@ -766,13 +934,22 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
     Map<ServerType,Collection<ProcessReference>> result = new HashMap<>();
     MiniAccumuloClusterControl control = getClusterControl();
     result.put(ServerType.MANAGER, references(control.managerProcess));
-    result.put(ServerType.TABLET_SERVER,
-        references(control.tabletServerProcesses.toArray(new Process[0])));
+    result.put(ServerType.TABLET_SERVER, references(control.tabletServerProcesses.values().stream()
+        .flatMap(List::stream).collect(Collectors.toList()).toArray(new Process[0])));
+    result.put(ServerType.COMPACTOR, references(control.compactorProcesses.values().stream()
+        .flatMap(List::stream).collect(Collectors.toList()).toArray(new Process[0])));
+    if (control.scanServerProcesses != null) {
+      result.put(ServerType.SCAN_SERVER, references(control.scanServerProcesses.values().stream()
+          .flatMap(List::stream).collect(Collectors.toList()).toArray(new Process[0])));
+    }
     if (control.zooKeeperProcess != null) {
       result.put(ServerType.ZOOKEEPER, references(control.zooKeeperProcess));
     }
     if (control.gcProcess != null) {
       result.put(ServerType.GARBAGE_COLLECTOR, references(control.gcProcess));
+    }
+    if (control.monitor != null) {
+      result.put(ServerType.MONITOR, references(control.monitor));
     }
     return result;
   }
@@ -809,12 +986,32 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
       return;
     }
 
+    if (miniLock != null) {
+      try {
+        miniLock.unlock();
+      } catch (InterruptedException | KeeperException e) {
+        log.error("Error unlocking ServiceLock for MiniAccumuloClusterImpl", e);
+      }
+      miniLock = null;
+      this.getServerContext().clearServiceLock();
+    }
+    if (zk != null) {
+      zk.close();
+      zk = null;
+    }
+    if (client != null) {
+      client.close();
+      client = null;
+    }
+
     MiniAccumuloClusterControl control = getClusterControl();
 
     control.stop(ServerType.GARBAGE_COLLECTOR, null);
     control.stop(ServerType.MANAGER, null);
     control.stop(ServerType.TABLET_SERVER, null);
     control.stop(ServerType.ZOOKEEPER, null);
+    control.stop(ServerType.COMPACTOR, null);
+    control.stop(ServerType.SCAN_SERVER, null);
 
     // ACCUMULO-2985 stop the ExecutorService after we finished using it to stop accumulo procs
     if (executor != null) {
@@ -945,4 +1142,5 @@ public class MiniAccumuloClusterImpl implements AccumuloCluster {
   public String getClientPropsPath() {
     return config.getClientPropsFile().getAbsolutePath();
   }
+
 }

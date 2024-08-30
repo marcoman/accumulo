@@ -18,10 +18,11 @@
  */
 package org.apache.accumulo.manager.tableOps.bulkVer2;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.accumulo.core.metadata.schema.TabletMetadata.ColumnType.LOADED;
 import static org.apache.accumulo.core.metadata.schema.TabletMetadata.ColumnType.LOCATION;
 import static org.apache.accumulo.core.metadata.schema.TabletMetadata.ColumnType.PREV_ROW;
+import static org.apache.accumulo.core.metadata.schema.TabletMetadata.ColumnType.TIME;
+import static org.apache.accumulo.core.metadata.schema.TabletMetadata.LocationType.CURRENT;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -31,42 +32,38 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
-import org.apache.accumulo.core.client.BatchWriter;
-import org.apache.accumulo.core.client.MutationsRejectedException;
 import org.apache.accumulo.core.clientImpl.bulk.Bulk;
 import org.apache.accumulo.core.clientImpl.bulk.Bulk.Files;
 import org.apache.accumulo.core.clientImpl.bulk.BulkSerialize;
 import org.apache.accumulo.core.clientImpl.bulk.LoadMappingIterator;
 import org.apache.accumulo.core.conf.Property;
-import org.apache.accumulo.core.data.Mutation;
 import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
 import org.apache.accumulo.core.dataImpl.thrift.TKeyExtent;
-import org.apache.accumulo.core.fate.FateTxId;
+import org.apache.accumulo.core.fate.FateId;
 import org.apache.accumulo.core.fate.Repo;
-import org.apache.accumulo.core.manager.state.tables.TableState;
+import org.apache.accumulo.core.logging.TabletLogger;
 import org.apache.accumulo.core.manager.thrift.BulkImportState;
-import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.ReferencedTabletFile;
 import org.apache.accumulo.core.metadata.StoredTabletFile;
+import org.apache.accumulo.core.metadata.TabletFile;
+import org.apache.accumulo.core.metadata.schema.Ample;
+import org.apache.accumulo.core.metadata.schema.Ample.ConditionalResult.Status;
 import org.apache.accumulo.core.metadata.schema.DataFileValue;
-import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection.DataFileColumnFamily;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata;
-import org.apache.accumulo.core.metadata.schema.TabletMetadata.Location;
 import org.apache.accumulo.core.metadata.schema.TabletsMetadata;
 import org.apache.accumulo.core.rpc.ThriftUtil;
 import org.apache.accumulo.core.rpc.clients.ThriftClientTypes;
-import org.apache.accumulo.core.tabletingest.thrift.DataFileInfo;
-import org.apache.accumulo.core.tabletingest.thrift.TabletIngestClientService.Client;
+import org.apache.accumulo.core.tabletserver.thrift.TabletServerClientService;
 import org.apache.accumulo.core.trace.TraceUtil;
-import org.apache.accumulo.core.util.MapCounter;
 import org.apache.accumulo.core.util.PeekingIterator;
-import org.apache.accumulo.core.util.TextUtil;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.ManagerRepo;
 import org.apache.accumulo.server.fs.VolumeManager;
+import org.apache.accumulo.server.tablets.TabletTime;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.Text;
 import org.apache.thrift.TException;
@@ -93,10 +90,10 @@ class LoadFiles extends ManagerRepo {
   }
 
   @Override
-  public long isReady(long tid, Manager manager) throws Exception {
+  public long isReady(FateId fateId, Manager manager) throws Exception {
     if (manager.onlineTabletServers().isEmpty()) {
-      log.warn("There are no tablet server to process bulkDir import, waiting (tid = "
-          + FateTxId.formatTid(tid) + ")");
+      log.warn("There are no tablet server to process bulkDir import, waiting (fateId = " + fateId
+          + ")");
       return 100;
     }
     VolumeManager fs = manager.getVolumeManager();
@@ -104,214 +101,220 @@ class LoadFiles extends ManagerRepo {
     manager.updateBulkImportStatus(bulkInfo.sourceDir, BulkImportState.LOADING);
     try (LoadMappingIterator lmi =
         BulkSerialize.getUpdatedLoadMapping(bulkDir.toString(), bulkInfo.tableId, fs::open)) {
-      return loadFiles(bulkInfo.tableId, bulkDir, lmi, manager, tid);
+      return loadFiles(bulkInfo.tableId, bulkDir, lmi, manager, fateId);
     }
   }
 
   @Override
-  public Repo<Manager> call(final long tid, final Manager manager) {
-    if (bulkInfo.tableState == TableState.ONLINE) {
-      return new CompleteBulkImport(bulkInfo);
-    } else {
-      return new CleanUpBulkImport(bulkInfo);
-    }
+  public Repo<Manager> call(final FateId fateId, final Manager manager) {
+    return new RefreshTablets(bulkInfo);
   }
 
-  private abstract static class Loader {
+  private static class Loader {
     protected Path bulkDir;
     protected Manager manager;
-    protected long tid;
+    protected FateId fateId;
     protected boolean setTime;
+    Ample.ConditionalTabletsMutator conditionalMutator;
+    private Map<KeyExtent,List<TabletFile>> loadingFiles;
 
-    void start(Path bulkDir, Manager manager, long tid, boolean setTime) throws Exception {
+    private long skipped = 0;
+
+    void start(Path bulkDir, Manager manager, FateId fateId, boolean setTime) throws Exception {
       this.bulkDir = bulkDir;
       this.manager = manager;
-      this.tid = tid;
+      this.fateId = fateId;
       this.setTime = setTime;
+      conditionalMutator = manager.getContext().getAmple().conditionallyMutateTablets();
+      this.skipped = 0;
+      this.loadingFiles = new HashMap<>();
     }
 
-    abstract void load(List<TabletMetadata> tablets, Files files) throws Exception;
+    void load(List<TabletMetadata> tablets, Files files) {
 
-    abstract long finish() throws Exception;
-  }
+      Map<ReferencedTabletFile,Bulk.FileInfo> toLoad = new HashMap<>();
+      for (var fileInfo : files) {
+        toLoad.put(new ReferencedTabletFile(new Path(bulkDir, fileInfo.getFileName())), fileInfo);
+      }
 
-  private static class OnlineLoader extends Loader {
+      // remove any tablets that already have loaded flags
+      tablets = tablets.stream().filter(tabletMeta -> {
+        Set<ReferencedTabletFile> loaded = tabletMeta.getLoaded().keySet().stream()
+            .map(StoredTabletFile::getTabletFile).collect(Collectors.toSet());
+        return !loaded.containsAll(toLoad.keySet());
+      }).collect(Collectors.toList());
 
-    long timeInMillis;
-    String fmtTid;
-    int locationLess = 0;
+      // timestamps from tablets that are hosted on a tablet server
+      Map<KeyExtent,Long> hostedTimestamps;
+      if (setTime) {
+        hostedTimestamps = allocateTimestamps(tablets, toLoad.size());
+        hostedTimestamps.forEach((e, t) -> {
+          log.trace("{} allocated timestamp {} {}", fateId, e, t);
+        });
+      } else {
+        hostedTimestamps = Map.of();
+      }
 
-    // track how many tablets were sent load messages per tablet server
-    MapCounter<HostAndPort> loadMsgs;
+      for (TabletMetadata tablet : tablets) {
+        if (setTime && tablet.getLocation() != null
+            && !hostedTimestamps.containsKey(tablet.getExtent())) {
+          skipped++;
+          log.debug("{} tablet {} did not have a timestamp allocated, will retry later", fateId,
+              tablet.getExtent());
+          continue;
+        }
 
-    // Each RPC to a tablet server needs to check in zookeeper to see if the transaction is still
-    // active. The purpose of this map is to group load request by tablet servers inorder to do less
-    // RPCs. Less RPCs will result in less calls to Zookeeper.
-    Map<HostAndPort,Map<TKeyExtent,Map<String,DataFileInfo>>> loadQueue;
-    private int queuedDataSize = 0;
+        Map<ReferencedTabletFile,DataFileValue> filesToLoad = new HashMap<>();
 
-    @Override
-    void start(Path bulkDir, Manager manager, long tid, boolean setTime) throws Exception {
-      super.start(bulkDir, manager, tid, setTime);
+        var tabletTime = TabletTime.getInstance(tablet.getTime());
 
-      timeInMillis = manager.getConfiguration().getTimeInMillis(Property.MANAGER_BULK_TIMEOUT);
-      fmtTid = FateTxId.formatTid(tid);
+        int timeOffset = 0;
 
-      loadMsgs = new MapCounter<>();
+        for (var entry : toLoad.entrySet()) {
+          ReferencedTabletFile refTabFile = entry.getKey();
+          Bulk.FileInfo fileInfo = entry.getValue();
 
-      loadQueue = new HashMap<>();
-    }
+          DataFileValue dfv;
 
-    private void sendQueued(int threshhold) {
-      if (queuedDataSize > threshhold || threshhold == 0) {
-        loadQueue.forEach((server, tabletFiles) -> {
-
-          if (log.isTraceEnabled()) {
-            log.trace("{} asking {} to bulk import {} files for {} tablets", fmtTid, server,
-                tabletFiles.values().stream().mapToInt(Map::size).sum(), tabletFiles.size());
+          if (setTime) {
+            if (tablet.getLocation() == null) {
+              dfv = new DataFileValue(fileInfo.getEstFileSize(), fileInfo.getEstNumEntries(),
+                  tabletTime.getAndUpdateTime());
+            } else {
+              long fileTime = hostedTimestamps.get(tablet.getExtent()) + timeOffset;
+              dfv = new DataFileValue(fileInfo.getEstFileSize(), fileInfo.getEstNumEntries(),
+                  fileTime);
+              tabletTime.updateTimeIfGreater(fileTime);
+              timeOffset++;
+            }
+          } else {
+            dfv = new DataFileValue(fileInfo.getEstFileSize(), fileInfo.getEstNumEntries());
           }
 
-          Client client = null;
-          try {
-            client = ThriftUtil.getClient(ThriftClientTypes.TABLET_INGEST, server,
-                manager.getContext(), timeInMillis);
-            client.loadFiles(TraceUtil.traceInfo(), manager.getContext().rpcCreds(), tid,
-                bulkDir.toString(), tabletFiles, setTime);
-          } catch (TException ex) {
-            log.debug("rpc failed server: " + server + ", " + fmtTid + " " + ex.getMessage(), ex);
-          } finally {
-            ThriftUtil.returnClient(client, manager.getContext());
-          }
+          filesToLoad.put(refTabFile, dfv);
+
+        }
+
+        // remove any files that were already loaded
+        tablet.getLoaded().keySet().forEach(stf -> {
+          filesToLoad.keySet().remove(stf.getTabletFile());
         });
 
-        loadQueue.clear();
-        queuedDataSize = 0;
-      }
-    }
+        if (!filesToLoad.isEmpty()) {
+          var tabletMutator =
+              conditionalMutator.mutateTablet(tablet.getExtent()).requireAbsentOperation();
 
-    private void addToQueue(HostAndPort server, KeyExtent extent,
-        Map<String,DataFileInfo> thriftImports) {
-      if (!thriftImports.isEmpty()) {
-        loadMsgs.increment(server, 1);
+          if (setTime) {
+            tabletMutator.requireSame(tablet, LOADED, TIME, LOCATION);
+          } else {
+            tabletMutator.requireSame(tablet, LOADED, LOCATION);
+          }
 
-        Map<String,DataFileInfo> prev = loadQueue.computeIfAbsent(server, k -> new HashMap<>())
-            .putIfAbsent(extent.toThrift(), thriftImports);
+          filesToLoad.forEach((f, v) -> {
+            tabletMutator.putBulkFile(f, fateId);
+            tabletMutator.putFile(f, v);
+          });
 
-        Preconditions.checkState(prev == null, "Unexpectedly saw extent %s twice", extent);
+          if (setTime) {
+            tabletMutator.putTime(tabletTime.getMetadataTime());
+          }
 
-        // keep a very rough estimate of how much is memory so we can send if over a few megs is
-        // buffered
-        queuedDataSize += thriftImports.keySet().stream().mapToInt(String::length).sum()
-            + server.getHost().length() + 4 + thriftImports.size() * 32;
-      }
-    }
+          // Hang on to for logging purposes in the case where the update is a
+          // success.
+          Preconditions.checkState(
+              loadingFiles.put(tablet.getExtent(), List.copyOf(filesToLoad.keySet())) == null);
 
-    @Override
-    void load(List<TabletMetadata> tablets, Files files) {
-      for (TabletMetadata tablet : tablets) {
-        // send files to tablet sever
-        // ideally there should only be one tablet location to send all the files
-
-        Location location = tablet.getLocation();
-        HostAndPort server = null;
-        if (location == null) {
-          locationLess++;
-          continue;
-        } else {
-          server = location.getHostAndPort();
+          tabletMutator.submit(tm -> false);
         }
+      }
+    }
 
-        Set<ReferencedTabletFile> loadedFiles = tablet.getLoaded().keySet().stream()
-            .map(StoredTabletFile::getTabletFile).collect(Collectors.toSet());
+    private Map<KeyExtent,Long> allocateTimestamps(List<TabletMetadata> tablets, int numStamps) {
 
-        Map<String,DataFileInfo> thriftImports = new HashMap<>();
+      Map<HostAndPort,List<TKeyExtent>> serversToAsk = new HashMap<>();
 
-        for (final Bulk.FileInfo fileInfo : files) {
-          Path fullPath = new Path(bulkDir, fileInfo.getFileName());
-          ReferencedTabletFile bulkFile = new ReferencedTabletFile(fullPath);
+      Map<KeyExtent,Long> allTimestamps = new HashMap<>();
 
-          if (!loadedFiles.contains(bulkFile)) {
-            thriftImports.put(fileInfo.getFileName(), new DataFileInfo(fileInfo.getEstFileSize()));
+      for (var tablet : tablets) {
+        if (tablet.getLocation() != null && tablet.getLocation().getType() == CURRENT) {
+          var location = tablet.getLocation().getHostAndPort();
+          serversToAsk.computeIfAbsent(location, l -> new ArrayList<>())
+              .add(tablet.getExtent().toThrift());
+        }
+      }
+
+      for (var entry : serversToAsk.entrySet()) {
+        HostAndPort server = entry.getKey();
+        List<TKeyExtent> extents = entry.getValue();
+
+        Map<KeyExtent,Long> serversTimestamps = allocateTimestamps(server, extents, numStamps);
+        allTimestamps.putAll(serversTimestamps);
+
+      }
+
+      return allTimestamps;
+    }
+
+    private Map<KeyExtent,Long> allocateTimestamps(HostAndPort server, List<TKeyExtent> extents,
+        int numStamps) {
+      TabletServerClientService.Client client = null;
+      var context = manager.getContext();
+      try {
+
+        log.trace("{} sending allocate timestamps request to {} for {} extents", fateId, server,
+            extents.size());
+        var timeInMillis =
+            context.getConfiguration().getTimeInMillis(Property.MANAGER_BULK_TIMEOUT);
+        client =
+            ThriftUtil.getClient(ThriftClientTypes.TABLET_SERVER, server, context, timeInMillis);
+
+        var timestamps = client.allocateTimestamps(TraceUtil.traceInfo(), context.rpcCreds(),
+            extents, numStamps);
+
+        log.trace("{} allocate timestamps request to {} returned {} timestamps", fateId, server,
+            timestamps.size());
+
+        var converted = new HashMap<KeyExtent,Long>();
+        timestamps.forEach((k, v) -> converted.put(KeyExtent.fromThrift(k), v));
+        return converted;
+      } catch (TException ex) {
+        log.debug("rpc failed server: " + server + ", " + fateId + " " + ex.getMessage(), ex);
+        // return an empty map, should retry later
+        return Map.of();
+      } finally {
+        ThriftUtil.returnClient(client, context);
+      }
+
+    }
+
+    long finish() {
+      var results = conditionalMutator.process();
+
+      AtomicBoolean seenFailure = new AtomicBoolean(false);
+      results.forEach((extent, condResult) -> {
+        if (condResult.getStatus() == Status.ACCEPTED) {
+          loadingFiles.get(extent).forEach(file -> TabletLogger.bulkImported(extent, file));
+          // Trigger a check for compaction now that new files were added via bulk load
+          manager.getEventCoordinator().event(extent, "Bulk load completed on tablet %s", extent);
+        } else {
+          seenFailure.set(true);
+          var metadata = condResult.readMetadata();
+          if (metadata == null) {
+            log.debug("Tablet update failed, tablet is gone {} {} {}", fateId, extent,
+                condResult.getStatus());
+          } else {
+            log.debug("Tablet update failed {} {} {} {} {} {}", fateId, extent,
+                condResult.getStatus(), metadata.getOperationId(), metadata.getLocation(),
+                metadata.getLoaded());
           }
         }
+      });
 
-        addToQueue(server, tablet.getExtent(), thriftImports);
+      if (seenFailure.get() || skipped != 0) {
+        return 1000;
+      } else {
+        return 0;
       }
-
-      sendQueued(4 * 1024 * 1024);
-    }
-
-    @Override
-    long finish() {
-
-      sendQueued(0);
-
-      long sleepTime = 0;
-      if (loadMsgs.size() > 0) {
-        // find which tablet server had the most load messages sent to it and sleep 13ms for each
-        // load message
-        sleepTime = loadMsgs.max() * 13;
-      }
-
-      if (locationLess > 0) {
-        sleepTime = Math.max(Math.max(100L, locationLess), sleepTime);
-      }
-
-      return sleepTime;
-    }
-
-  }
-
-  private static class OfflineLoader extends Loader {
-
-    BatchWriter bw;
-
-    // track how many tablets were sent load messages per tablet server
-    MapCounter<HostAndPort> unloadingTablets;
-
-    @Override
-    void start(Path bulkDir, Manager manager, long tid, boolean setTime) throws Exception {
-      Preconditions.checkArgument(!setTime);
-      super.start(bulkDir, manager, tid, setTime);
-      bw = manager.getContext().createBatchWriter(AccumuloTable.METADATA.tableName());
-      unloadingTablets = new MapCounter<>();
-    }
-
-    @Override
-    void load(List<TabletMetadata> tablets, Files files) throws MutationsRejectedException {
-      byte[] fam = TextUtil.getBytes(DataFileColumnFamily.NAME);
-      for (TabletMetadata tablet : tablets) {
-        if (tablet.getLocation() != null) {
-          unloadingTablets.increment(tablet.getLocation().getHostAndPort(), 1L);
-          continue;
-        }
-
-        Mutation mutation = new Mutation(tablet.getExtent().toMetaRow());
-
-        for (final Bulk.FileInfo fileInfo : files) {
-          StoredTabletFile fullPath =
-              StoredTabletFile.of(new Path(bulkDir, fileInfo.getFileName()));
-          byte[] val =
-              new DataFileValue(fileInfo.getEstFileSize(), fileInfo.getEstNumEntries()).encode();
-          mutation.put(fam, fullPath.getMetadata().getBytes(UTF_8), val);
-        }
-
-        bw.addMutation(mutation);
-      }
-    }
-
-    @Override
-    long finish() throws Exception {
-
-      bw.close();
-
-      long sleepTime = 0;
-      if (unloadingTablets.size() > 0) {
-        // find which tablet server had the most tablets to unload and sleep 13ms for each tablet
-        sleepTime = unloadingTablets.max() * 13;
-      }
-
-      return sleepTime;
     }
   }
 
@@ -322,23 +325,18 @@ class LoadFiles extends ManagerRepo {
    * all files have been loaded.
    */
   private long loadFiles(TableId tableId, Path bulkDir, LoadMappingIterator loadMapIter,
-      Manager manager, long tid) throws Exception {
+      Manager manager, FateId fateId) throws Exception {
     PeekingIterator<Map.Entry<KeyExtent,Bulk.Files>> lmi = new PeekingIterator<>(loadMapIter);
     Map.Entry<KeyExtent,Bulk.Files> loadMapEntry = lmi.peek();
 
     Text startRow = loadMapEntry.getKey().prevEndRow();
 
-    Loader loader;
-    if (bulkInfo.tableState == TableState.ONLINE) {
-      loader = new OnlineLoader();
-    } else {
-      loader = new OfflineLoader();
-    }
+    Loader loader = new Loader();
     long t1;
-    loader.start(bulkDir, manager, tid, bulkInfo.setTime);
+    loader.start(bulkDir, manager, fateId, bulkInfo.setTime);
     try (TabletsMetadata tabletsMetadata =
         TabletsMetadata.builder(manager.getContext()).forTable(tableId).overlapping(startRow, null)
-            .checkConsistency().fetch(PREV_ROW, LOCATION, LOADED).build()) {
+            .checkConsistency().fetch(PREV_ROW, LOCATION, LOADED, TIME).build()) {
 
       t1 = System.currentTimeMillis();
       while (lmi.hasNext()) {

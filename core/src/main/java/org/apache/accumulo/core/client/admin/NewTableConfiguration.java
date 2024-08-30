@@ -72,6 +72,7 @@ public class NewTableConfiguration {
   private Map<String,String> localityProps = Collections.emptyMap();
   private final Map<String,String> iteratorProps = new HashMap<>();
   private SortedSet<Text> splitProps = Collections.emptySortedSet();
+  private TabletAvailability initialTabletAvailability = TabletAvailability.ONDEMAND;
 
   private void checkDisjoint(Map<String,String> props, Map<String,String> derivedProps,
       String kind) {
@@ -313,6 +314,25 @@ public class NewTableConfiguration {
       checkDisjoint(properties, iteratorProps, "iterator");
     }
     return this;
+  }
+
+  /**
+   * Sets the initial tablet availability for all tablets. If not set, the default is
+   * {@link TabletAvailability#ONDEMAND}
+   *
+   * @since 4.0.0
+   */
+  public NewTableConfiguration
+      withInitialTabletAvailability(final TabletAvailability tabletAvailability) {
+    this.initialTabletAvailability = tabletAvailability;
+    return this;
+  }
+
+  /**
+   * @since 4.0.0
+   */
+  public TabletAvailability getInitialTabletAvailability() {
+    return this.initialTabletAvailability;
   }
 
   /**

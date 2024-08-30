@@ -22,6 +22,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.stream.Collectors.groupingBy;
 import static org.apache.accumulo.core.file.blockfile.impl.CachableBlockFile.pathToCacheId;
 import static org.apache.accumulo.core.util.Validators.EXISTING_TABLE_NAME;
+import static org.apache.accumulo.core.util.threads.ThreadPoolNames.BULK_IMPORT_CLIENT_BULK_THREADS_POOL;
+import static org.apache.accumulo.core.util.threads.ThreadPoolNames.BULK_IMPORT_CLIENT_LOAD_POOL;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -76,6 +78,7 @@ import org.apache.accumulo.core.file.FileSKVIterator;
 import org.apache.accumulo.core.metadata.UnreferencedTabletFile;
 import org.apache.accumulo.core.spi.crypto.CryptoService;
 import org.apache.accumulo.core.util.Retry;
+import org.apache.accumulo.core.util.cache.Caches.CacheName;
 import org.apache.accumulo.core.volume.VolumeConfiguration;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.hadoop.fs.FileStatus;
@@ -86,7 +89,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Sets;
 
@@ -361,13 +363,15 @@ public class BulkImport implements ImportDestinationArguments, ImportMappingOpti
     return fileLens;
   }
 
-  private static Cache<String,Long> getPopulatedFileLenCache(Path dir, List<FileStatus> statuses) {
+  private static Cache<String,Long> getPopulatedFileLenCache(ClientContext ctx, Path dir,
+      List<FileStatus> statuses) {
     Map<String,Long> fileLens = getFileLenMap(statuses);
 
     Map<String,Long> absFileLens = new HashMap<>();
     fileLens.forEach((k, v) -> absFileLens.put(pathToCacheId(new Path(dir, k)), v));
 
-    Cache<String,Long> fileLenCache = Caffeine.newBuilder().build();
+    Cache<String,Long> fileLenCache =
+        ctx.getCaches().createNewBuilder(CacheName.BULK_IMPORT_FILE_LENGTHS, false).build();
 
     fileLenCache.putAll(absFileLens);
 
@@ -464,12 +468,14 @@ public class BulkImport implements ImportDestinationArguments, ImportMappingOpti
     if (this.executor != null) {
       executor = this.executor;
     } else if (numThreads > 0) {
-      executor = service = context.threadPools().getPoolBuilder("BulkImportThread")
-          .numCoreThreads(numThreads).build();
+      executor = service = context.threadPools().getPoolBuilder(BULK_IMPORT_CLIENT_LOAD_POOL)
+          .numCoreThreads(numThreads).enableThreadPoolMetrics().build();
     } else {
       String threads = context.getConfiguration().get(ClientProperty.BULK_LOAD_THREADS.getKey());
-      executor = service = context.threadPools().getPoolBuilder("BulkImportThread")
-          .numCoreThreads(ConfigurationTypeHelper.getNumThreads(threads)).build();
+      executor =
+          service = context.threadPools().getPoolBuilder(BULK_IMPORT_CLIENT_BULK_THREADS_POOL)
+              .numCoreThreads(ConfigurationTypeHelper.getNumThreads(threads))
+              .enableThreadPoolMetrics().build();
     }
 
     try {
@@ -522,7 +528,7 @@ public class BulkImport implements ImportDestinationArguments, ImportMappingOpti
 
     // we know all of the file lens, so construct a cache and populate it in order to avoid later
     // trips to the namenode
-    Cache<String,Long> fileLensCache = getPopulatedFileLenCache(dirPath, files);
+    Cache<String,Long> fileLensCache = getPopulatedFileLenCache(context, dirPath, files);
 
     List<CompletableFuture<Map<KeyExtent,Bulk.FileInfo>>> futures = new ArrayList<>();
 

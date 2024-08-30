@@ -19,6 +19,7 @@
 package org.apache.accumulo.tserver.log;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.apache.accumulo.core.util.threads.ThreadPoolNames.TSERVER_WAL_SORT_CONCURRENT_POOL;
 
 import java.io.DataInputStream;
 import java.io.EOFException;
@@ -62,6 +63,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.MoreExecutors;
 
 public class LogSorter {
 
@@ -290,13 +292,31 @@ public class LogSorter {
     }
   }
 
-  public void startWatchingForRecoveryLogs() throws KeeperException, InterruptedException {
-    int threadPoolSize = this.conf.getCount(Property.TSERV_WAL_SORT_MAX_CONCURRENT);
+  /**
+   * Sort any logs that need sorting in the current thread.
+   *
+   * @return The time in millis when the next check can be done.
+   */
+  public long sortLogsIfNeeded() throws KeeperException, InterruptedException {
+    DistributedWorkQueue dwq = new DistributedWorkQueue(
+        context.getZooKeeperRoot() + Constants.ZRECOVERY, sortedLogConf, context);
+    dwq.processExistingWork(new LogProcessor(), MoreExecutors.newDirectExecutorService(), 1, false);
+    return System.currentTimeMillis() + dwq.getCheckInterval();
+  }
+
+  /**
+   * Sort any logs that need sorting in a ThreadPool using
+   * {@link Property#TSERV_WAL_SORT_MAX_CONCURRENT} threads. This method will start a background
+   * thread to look for log sorting work in the future that will be processed by the
+   * ThreadPoolExecutor
+   */
+  public void startWatchingForRecoveryLogs(int threadPoolSize)
+      throws KeeperException, InterruptedException {
     ThreadPoolExecutor threadPool =
-        ThreadPools.getServerThreadPools().getPoolBuilder(this.getClass().getName())
+        ThreadPools.getServerThreadPools().getPoolBuilder(TSERVER_WAL_SORT_CONCURRENT_POOL)
             .numCoreThreads(threadPoolSize).enableThreadPoolMetrics().build();
     new DistributedWorkQueue(context.getZooKeeperRoot() + Constants.ZRECOVERY, sortedLogConf,
-        context).startProcessing(new LogProcessor(), threadPool);
+        context).processExistingAndFuture(new LogProcessor(), threadPool);
   }
 
   public List<RecoveryStatus> getLogSorts() {

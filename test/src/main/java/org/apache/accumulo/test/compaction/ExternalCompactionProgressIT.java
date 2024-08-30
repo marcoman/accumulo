@@ -20,7 +20,7 @@ package org.apache.accumulo.test.compaction;
 
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
-import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.QUEUE1;
+import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.GROUP1;
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.compact;
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.createTable;
 import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.getRunningCompactions;
@@ -30,19 +30,16 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.accumulo.compactor.Compactor;
-import org.apache.accumulo.coordinator.CompactionCoordinator;
 import org.apache.accumulo.core.client.Accumulo;
 import org.apache.accumulo.core.client.AccumuloClient;
 import org.apache.accumulo.core.client.IteratorSetting;
@@ -56,24 +53,27 @@ import org.apache.accumulo.core.iterators.IteratorUtil;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata;
 import org.apache.accumulo.core.metadata.schema.TabletsMetadata;
 import org.apache.accumulo.core.metrics.MetricsProducer;
-import org.apache.accumulo.core.util.UtilWaitThread;
+import org.apache.accumulo.core.util.compaction.ExternalCompactionUtil;
 import org.apache.accumulo.core.util.compaction.RunningCompactionInfo;
 import org.apache.accumulo.core.util.threads.Threads;
 import org.apache.accumulo.harness.AccumuloClusterHarness;
-import org.apache.accumulo.minicluster.ServerType;
 import org.apache.accumulo.miniclusterImpl.MiniAccumuloConfigImpl;
+import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.test.functional.SlowIterator;
 import org.apache.accumulo.test.metrics.TestStatsDRegistryFactory;
 import org.apache.accumulo.test.metrics.TestStatsDSink;
 import org.apache.accumulo.test.util.Wait;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.thrift.TException;
+import org.apache.thrift.transport.TTransportException;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.google.common.net.HostAndPort;
 
 /**
  * Tests that external compactions report progress from start to finish. To prevent flaky test
@@ -117,6 +117,7 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
   @Override
   public void configureMiniCluster(MiniAccumuloConfigImpl cfg, Configuration coreSite) {
     ExternalCompactionTestUtils.configureMiniCluster(cfg, coreSite);
+    cfg.getClusterServerConfiguration().addCompactorResourceGroup(GROUP1, 1);
     cfg.setProperty(Property.GENERAL_MICROMETER_ENABLED, "true");
     cfg.setProperty(Property.GENERAL_MICROMETER_FACTORY, TestStatsDRegistryFactory.class.getName());
     Map<String,String> sysProps = Map.of(TestStatsDRegistryFactory.SERVER_HOST, "127.0.0.1",
@@ -125,112 +126,20 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
   }
 
   @Test
-  public void testCompactionDurationContinuesAfterCoordinatorStop() throws Exception {
-    String table = this.getUniqueNames(1)[0];
-
-    try (AccumuloClient client =
-        Accumulo.newClient().from(getCluster().getClientProperties()).build()) {
-      createTable(client, table, "cs1");
-      writeData(client, table, ROWS);
-
-      cluster.getClusterControl().startCompactors(Compactor.class, 1, QUEUE1);
-      cluster.getClusterControl().startCoordinator(CompactionCoordinator.class);
-
-      IteratorSetting setting = new IteratorSetting(50, "Slow", SlowIterator.class);
-      SlowIterator.setSleepTime(setting, 5);
-      client.tableOperations().attachIterator(table, setting,
-          EnumSet.of(IteratorUtil.IteratorScope.majc));
-
-      log.info("Compacting table");
-      compact(client, table, 2, QUEUE1, false);
-
-      // Wait until the compaction starts
-      Wait.waitFor(() -> {
-        Map<String,TExternalCompaction> compactions =
-            getRunningCompactions(getCluster().getServerContext()).getCompactions();
-        return compactions == null || compactions.isEmpty();
-      }, 30_000, 100, "Compaction did not start within the expected time");
-
-      // start a timer after the compaction starts
-      long compactionStartTime = System.nanoTime();
-
-      // let the compaction advance a bit
-      sleepUninterruptibly(6, TimeUnit.SECONDS);
-
-      // Stop the coordinator
-      log.info("Stopping the coordinator");
-      cluster.getClusterControl().stopAllServers(ServerType.COMPACTION_COORDINATOR);
-
-      sleepUninterruptibly(5, TimeUnit.SECONDS);
-
-      log.info("Restarting the coordinator");
-      cluster.getClusterControl().startCoordinator(CompactionCoordinator.class);
-      long coordinatorRestartTime = System.nanoTime();
-
-      // Wait for compactions to be present
-      Map<String,TExternalCompaction> metrics = null;
-      while (metrics == null) {
-        try {
-          metrics = getRunningCompactions(getCluster().getServerContext()).getCompactions();
-        } catch (TException e) {
-          UtilWaitThread.sleep(250);
-        }
-      }
-
-      // let the compaction advance a bit
-      sleepUninterruptibly(6, TimeUnit.SECONDS);
-
-      TExternalCompaction updatedCompaction = getRunningCompactions(getCluster().getServerContext())
-          .getCompactions().values().iterator().next();
-      RunningCompactionInfo updatedCompactionInfo = new RunningCompactionInfo(updatedCompaction);
-
-      final Duration reportedCompactionDuration = Duration.ofNanos(updatedCompactionInfo.duration);
-      final Duration measuredCompactionDuration =
-          Duration.ofNanos(System.nanoTime() - compactionStartTime);
-      final Duration coordinatorAge = Duration.ofNanos(System.nanoTime() - coordinatorRestartTime);
-      log.info(
-          "Coordinator age: {}s. Measured compaction duration: {}s. Reported compaction duration: {}s",
-          coordinatorAge.toSeconds(), measuredCompactionDuration.toSeconds(),
-          reportedCompactionDuration.toSeconds());
-
-      assertTrue(coordinatorAge.compareTo(reportedCompactionDuration) < 0,
-          "Reported compaction age should be greater than the coordinator age");
-
-      // Verify that the reported duration is approximately equal to the elapsed time
-      Duration tolerance = Duration.ofSeconds(7);
-      long reportedVsMeasuredDiff =
-          Math.abs(reportedCompactionDuration.minus(measuredCompactionDuration).toNanos());
-      assertTrue(reportedVsMeasuredDiff <= tolerance.toNanos(),
-          String.format(
-              "Reported duration (%s) and elapsed time (%s) differ by more than the tolerance (%s)",
-              reportedCompactionDuration.toSeconds(), measuredCompactionDuration.toSeconds(),
-              tolerance.toSeconds()));
-    } finally {
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTOR);
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTION_COORDINATOR);
-    }
-  }
-
-  @Test
   public void testProgressViaMetrics() throws Exception {
     String table = this.getUniqueNames(1)[0];
 
     final AtomicLong totalEntriesRead = new AtomicLong(0);
     final AtomicLong totalEntriesWritten = new AtomicLong(0);
-    final AtomicInteger compactorBusy = new AtomicInteger(-1);
-    final long expectedEntriesRead = 9216;
-    final long expectedEntriesWritten = 4096;
+    final long expectedEntriesRead = 18432;
+    final long expectedEntriesWritten = 13312;
 
-    Thread checkerThread =
-        getMetricsCheckerThread(totalEntriesRead, totalEntriesWritten, compactorBusy);
+    Thread checkerThread = getMetricsCheckerThread(totalEntriesRead, totalEntriesWritten);
 
     try (AccumuloClient client =
         Accumulo.newClient().from(getCluster().getClientProperties()).build()) {
       createTable(client, table, "cs1");
       writeData(client, table, ROWS);
-
-      cluster.getClusterControl().startCompactors(Compactor.class, 1, QUEUE1);
-      cluster.getClusterControl().startCoordinator(CompactionCoordinator.class);
 
       checkerThread.start();
 
@@ -240,13 +149,7 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
           EnumSet.of(IteratorUtil.IteratorScope.majc));
       log.info("Compacting table");
 
-      Wait.waitFor(() -> compactorBusy.get() == 0, 30_000, CHECKER_THREAD_SLEEP_MS,
-          "Compactor busy metric should be false initially");
-
-      compact(client, table, 2, QUEUE1, false);
-
-      Wait.waitFor(() -> compactorBusy.get() == 1, 30_000, CHECKER_THREAD_SLEEP_MS,
-          "Compactor busy metric should be true after starting compaction");
+      compact(client, table, 2, GROUP1, true);
 
       Wait.waitFor(() -> {
         if (totalEntriesRead.get() == expectedEntriesRead
@@ -261,16 +164,11 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
       }, 30_000, CHECKER_THREAD_SLEEP_MS,
           "Entries read and written metrics values did not match expected values");
 
-      Wait.waitFor(() -> compactorBusy.get() == 0, 30_000, CHECKER_THREAD_SLEEP_MS,
-          "Compactor busy metric should be false once compaction completes");
-
       log.info("Done Compacting table");
       verify(client, table, 2, ROWS);
     } finally {
       stopCheckerThread.set(true);
       checkerThread.join();
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTOR);
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTION_COORDINATOR);
     }
   }
 
@@ -279,10 +177,9 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
    *
    * @param totalEntriesRead this is set to the value of the entries read metric
    * @param totalEntriesWritten this is set to the value of the entries written metric
-   * @param compactorBusy this is set to the value of the compactor busy metric
    */
   private static Thread getMetricsCheckerThread(AtomicLong totalEntriesRead,
-      AtomicLong totalEntriesWritten, AtomicInteger compactorBusy) {
+      AtomicLong totalEntriesWritten) {
     return Threads.createThread("metric-tailer", () -> {
       log.info("Starting metric tailer");
 
@@ -307,9 +204,6 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
             case MetricsProducer.METRICS_COMPACTOR_ENTRIES_WRITTEN:
               totalEntriesWritten.addAndGet(value);
               break;
-            case MetricsProducer.METRICS_COMPACTOR_BUSY:
-              compactorBusy.set(value);
-              break;
           }
         }
         sleepUninterruptibly(CHECKER_THREAD_SLEEP_MS, TimeUnit.MILLISECONDS);
@@ -326,9 +220,6 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
       createTable(client, table1, "cs1");
       writeData(client, table1, ROWS);
 
-      cluster.getClusterControl().startCompactors(Compactor.class, 1, QUEUE1);
-      cluster.getClusterControl().startCoordinator(CompactionCoordinator.class);
-
       Thread checkerThread = startChecker();
       checkerThread.start();
 
@@ -337,7 +228,7 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
       client.tableOperations().attachIterator(table1, setting,
           EnumSet.of(IteratorUtil.IteratorScope.majc));
       log.info("Compacting table");
-      compact(client, table1, 2, QUEUE1, true);
+      compact(client, table1, 2, GROUP1, true);
       verify(client, table1, 2, ROWS);
 
       log.info("Done Compacting table");
@@ -345,9 +236,6 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
       checkerThread.join();
 
       verifyProgress();
-    } finally {
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTOR);
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTION_COORDINATOR);
     }
   }
 
@@ -375,9 +263,6 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
       client.tableOperations().setProperty(tableName1, Property.TABLE_MAJC_RATIO.getKey(), "1000");
       client.tableOperations().setProperty(tableName2, Property.TABLE_MAJC_RATIO.getKey(), "1000");
 
-      getCluster().getClusterControl().startCoordinator(CompactionCoordinator.class);
-      getCluster().getClusterControl().startCompactors(Compactor.class, 1, QUEUE1);
-
       String dir = getDir(client, tableName1);
 
       log.info("Bulk importing files in dir " + dir + " to table " + tableName2);
@@ -402,9 +287,6 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
       checkerThread.join();
 
       verifyProgress();
-    } finally {
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTOR);
-      getCluster().getClusterControl().stopAllServers(ServerType.COMPACTION_COORDINATOR);
     }
   }
 
@@ -440,7 +322,13 @@ public class ExternalCompactionProgressIT extends AccumuloClusterHarness {
    * Check running compaction progress.
    */
   private void checkRunning() throws TException {
-    TExternalCompactionList ecList = getRunningCompactions(getCluster().getServerContext());
+    ServerContext ctx = getCluster().getServerContext();
+    Optional<HostAndPort> coordinatorHost = ExternalCompactionUtil.findCompactionCoordinator(ctx);
+    if (coordinatorHost.isEmpty()) {
+      throw new TTransportException("Unable to get CompactionCoordinator address from ZooKeeper");
+    }
+
+    TExternalCompactionList ecList = getRunningCompactions(ctx, coordinatorHost);
     Map<String,TExternalCompaction> ecMap = ecList.getCompactions();
     if (ecMap != null) {
       ecMap.forEach((ecid, ec) -> {

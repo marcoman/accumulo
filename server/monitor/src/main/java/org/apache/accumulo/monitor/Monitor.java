@@ -119,7 +119,7 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
   }
 
   Monitor(ConfigOpts opts, String[] args) {
-    super("monitor", opts, args);
+    super("monitor", opts, ServerContext::new, args);
     START_TIME = System.currentTimeMillis();
   }
 
@@ -156,7 +156,6 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
   private final List<Pair<Long,Double>> ingestRateOverTime = newMaxList();
   private final List<Pair<Long,Double>> ingestByteRateOverTime = newMaxList();
   private final List<Pair<Long,Integer>> minorCompactionsOverTime = newMaxList();
-  private final List<Pair<Long,Integer>> majorCompactionsOverTime = newMaxList();
   private final List<Pair<Long,Double>> lookupsOverTime = newMaxList();
   private final List<Pair<Long,Long>> queryRateOverTime = newMaxList();
   private final List<Pair<Long,Long>> scanRateOverTime = newMaxList();
@@ -295,7 +294,6 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
         }
       }
       if (mmi != null) {
-        int majorCompactions = 0;
         int minorCompactions = 0;
 
         lookupRateTracker.startingUpdates();
@@ -314,7 +312,6 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
           totalEntries += summary.recs;
           totalHoldTime += server.holdTime;
           totalLookups += server.lookups;
-          majorCompactions += summary.majors.running;
           minorCompactions += summary.minors.running;
           lookupRateTracker.updateTabletServer(server.name, server.lastContact, server.lookups);
           indexCacheHitTracker.updateTabletServer(server.name, server.lastContact,
@@ -361,7 +358,6 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
         loadOverTime.add(new Pair<>(currentTime, totalLoad));
 
         minorCompactionsOverTime.add(new Pair<>(currentTime, minorCompactions));
-        majorCompactionsOverTime.add(new Pair<>(currentTime, majorCompactions));
 
         lookupsOverTime.add(new Pair<>(currentTime, lookupRateTracker.calculateRate()));
 
@@ -491,9 +487,10 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
       log.error("Failed to get Monitor ZooKeeper lock");
       throw new RuntimeException(e);
     }
+    getContext().setServiceLock(monitorLock);
 
     MetricsInfo metricsInfo = getContext().getMetricsInfo();
-    metricsInfo.addServiceTags(getApplicationName(), monitorHostAndPort);
+    metricsInfo.addServiceTags(getApplicationName(), monitorHostAndPort, getResourceGroup());
     metricsInfo.addMetricsProducers(this);
     metricsInfo.init();
 
@@ -767,6 +764,7 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
 
   private void fetchCompactions() {
     ServerContext context = getContext();
+
     for (String server : context.instanceOperations().getTabletServers()) {
       final HostAndPort parsedServer = HostAndPort.fromString(server);
       Client tserver = null;
@@ -831,11 +829,15 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
 
     // Get a ZooLock for the monitor
     UUID zooLockUUID = UUID.randomUUID();
+    monitorLock = new ServiceLock(zoo.getZooKeeper(), monitorLockPath, zooLockUUID);
+
     while (true) {
       MoniterLockWatcher monitorLockWatcher = new MoniterLockWatcher();
-      monitorLock = new ServiceLock(zoo.getZooKeeper(), monitorLockPath, zooLockUUID);
-      monitorLock.lock(monitorLockWatcher, new ServiceLockData(zooLockUUID,
-          monitorLocation.getHost() + ":" + monitorLocation.getPort(), ThriftService.NONE));
+
+      monitorLock.lock(monitorLockWatcher,
+          new ServiceLockData(zooLockUUID,
+              monitorLocation.getHost() + ":" + monitorLocation.getPort(), ThriftService.NONE,
+              this.getResourceGroup()));
 
       monitorLockWatcher.waitForChange();
 
@@ -974,10 +976,6 @@ public class Monitor extends AbstractServer implements HighlyAvailableService {
 
   public List<Pair<Long,Integer>> getMinorCompactionsOverTime() {
     return new ArrayList<>(minorCompactionsOverTime);
-  }
-
-  public List<Pair<Long,Integer>> getMajorCompactionsOverTime() {
-    return new ArrayList<>(majorCompactionsOverTime);
   }
 
   public List<Pair<Long,Double>> getLookupsOverTime() {

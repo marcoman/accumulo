@@ -38,7 +38,6 @@ import org.apache.accumulo.harness.SharedMiniClusterBase;
 import org.apache.accumulo.minicluster.ServerType;
 import org.apache.accumulo.miniclusterImpl.MiniAccumuloConfigImpl;
 import org.apache.accumulo.test.util.Wait;
-import org.apache.accumulo.tserver.ScanServer;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.zookeeper.ZooKeeper;
 import org.junit.jupiter.api.AfterAll;
@@ -57,6 +56,7 @@ public class ScanServerGroupConfigurationIT extends SharedMiniClusterBase {
      "   \"maxBusyTimeout\": \"5m\","+
      "   \"busyTimeoutMultiplier\": 8,"+
      "   \"scanTypeActivations\": [],"+
+     "   \"timeToWaitForScanServers\":\"0s\","+
      "   \"attemptPlans\": ["+
      "     {"+
      "       \"servers\": \"3\","+
@@ -80,6 +80,7 @@ public class ScanServerGroupConfigurationIT extends SharedMiniClusterBase {
      "   \"busyTimeoutMultiplier\": 8,"+
      "   \"group\": \"GROUP1\","+
      "   \"scanTypeActivations\": [\"use_group1\"],"+
+     "   \"timeToWaitForScanServers\":\"0s\","+
      "   \"attemptPlans\": ["+
      "     {"+
      "       \"servers\": \"3\","+
@@ -103,7 +104,7 @@ public class ScanServerGroupConfigurationIT extends SharedMiniClusterBase {
   private static class Config implements MiniClusterConfigurationCallback {
     @Override
     public void configureMiniCluster(MiniAccumuloConfigImpl cfg, Configuration coreSite) {
-      cfg.setNumScanServers(0); // start with no scan servers
+      cfg.getClusterServerConfiguration().setNumDefaultScanServers(0); // start with no scan servers
       cfg.setProperty(Property.INSTANCE_ZK_TIMEOUT.getKey(), "10s");
 
       cfg.setClientProperty(ClientProperty.SCAN_SERVER_SELECTOR_OPTS_PREFIX.getKey() + "profiles",
@@ -146,7 +147,7 @@ public class ScanServerGroupConfigurationIT extends SharedMiniClusterBase {
             "The scanner should fall back to the tserver and should have seen all ingested and flushed entries");
 
         // Allow one scan server to be started at this time
-        getCluster().getConfig().setNumScanServers(1);
+        getCluster().getConfig().getClusterServerConfiguration().setNumDefaultScanServers(1);
 
         // Start a ScanServer. No group specified, should be in the default group.
         getCluster().getClusterControl().start(ServerType.SCAN_SERVER, "localhost");
@@ -163,13 +164,10 @@ public class ScanServerGroupConfigurationIT extends SharedMiniClusterBase {
             ScanServerIT.ingest(client, tableName, 10, 10, 10, "colf", true);
         assertEquals(100, additionalIngest1);
 
-        // Bump the number of scan serves that can run to start the GROUP1 scan server
-        getCluster().getConfig().setNumScanServers(2);
-        // If the following fails to start the ScanServer, it's possible that the value
-        // of property SSERV_GROUP_NAME has changed. If that is the case, then this test
-        // and the scripts need to be updated.
-        getCluster()._exec(ScanServer.class, ServerType.SCAN_SERVER, Map.of(),
-            new String[] {"-o", "sserver.group=GROUP1"});
+        // A a scan server for resource group GROUP1
+        getCluster().getConfig().getClusterServerConfiguration()
+            .addScanServerResourceGroup("GROUP1", 1);
+        getCluster().getClusterControl().start(ServerType.SCAN_SERVER);
         Wait.waitFor(() -> zk.getChildren(scanServerRoot, false).size() == 2);
         Wait.waitFor(() -> ((ClientContext) client).getScanServers().values().stream().anyMatch(
             (p) -> p.getSecond().equals(ScanServerSelector.DEFAULT_SCAN_SERVER_GROUP_NAME))

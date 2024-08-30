@@ -24,6 +24,8 @@ import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.accumulo.core.util.cache.Caches;
+import org.apache.accumulo.core.util.cache.Caches.CacheName;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.server.conf.codec.VersionedProperties;
 import org.apache.accumulo.server.conf.store.PropCache;
@@ -45,24 +47,25 @@ public class PropCacheCaffeineImpl implements PropCache {
   public static final int EXPIRE_MIN = 60;
   private static final Logger log = LoggerFactory.getLogger(PropCacheCaffeineImpl.class);
   private static final Executor executor =
-      ThreadPools.getServerThreadPools().getPoolBuilder("caffeine-tasks").numCoreThreads(1)
-          .numMaxThreads(20).withTimeOut(60L, SECONDS).build();
+      ThreadPools.getServerThreadPools().getPoolBuilder("caffeine.prop.cache.tasks")
+          .numCoreThreads(1).numMaxThreads(20).withTimeOut(60L, SECONDS).build();
 
   private final LoadingCache<PropStoreKey<?>,VersionedProperties> cache;
 
   private PropCacheCaffeineImpl(final CacheLoader<PropStoreKey<?>,VersionedProperties> cacheLoader,
       final Ticker ticker, boolean runTasksInline) {
-    var builder = Caffeine.newBuilder().expireAfterAccess(EXPIRE_MIN, BASE_TIME_UNITS)
-        .evictionListener(this::evictionNotifier);
+    Caffeine<Object,Object> caffeine =
+        Caches.getInstance().createNewBuilder(CacheName.PROP_CACHE, true)
+            .expireAfterAccess(EXPIRE_MIN, BASE_TIME_UNITS);
     if (runTasksInline) {
-      builder.executor(Runnable::run);
+      caffeine.executor(Runnable::run);
     } else {
-      builder.executor(executor);
+      caffeine.executor(executor);
     }
     if (ticker != null) {
-      builder.ticker(ticker);
+      caffeine.ticker(ticker);
     }
-    cache = builder.build(cacheLoader);
+    cache = caffeine.evictionListener(this::evictionNotifier).build(cacheLoader);
   }
 
   void evictionNotifier(PropStoreKey<?> propStoreKey, VersionedProperties value,

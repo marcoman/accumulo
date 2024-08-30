@@ -30,23 +30,59 @@ import org.apache.accumulo.core.clientImpl.thrift.TableOperationExceptionType;
 import org.apache.accumulo.core.data.InstanceId;
 import org.apache.accumulo.core.data.NamespaceId;
 import org.apache.accumulo.core.data.TableId;
+import org.apache.accumulo.core.fate.FateId;
+import org.apache.accumulo.core.fate.FateInstanceType;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.delete.PreDeleteTable;
 import org.apache.accumulo.server.ServerContext;
+import org.apache.zookeeper.KeeperException;
 import org.easymock.EasyMock;
 import org.junit.jupiter.api.Test;
 
 public class CompactionDriverTest {
 
+  public static class CancelledCompactionDriver extends CompactionDriver {
+
+    private static final long serialVersionUID = 1L;
+
+    public CancelledCompactionDriver(NamespaceId namespaceId, TableId tableId, byte[] startRow,
+        byte[] endRow) {
+      super(namespaceId, tableId, startRow, endRow);
+    }
+
+    @Override
+    protected boolean isCancelled(FateId fateId, ServerContext context)
+        throws InterruptedException, KeeperException {
+      return true;
+    }
+
+  }
+
+  public static class NotCancelledCompactionDriver extends CompactionDriver {
+
+    private static final long serialVersionUID = 1L;
+
+    public NotCancelledCompactionDriver(NamespaceId namespaceId, TableId tableId, byte[] startRow,
+        byte[] endRow) {
+      super(namespaceId, tableId, startRow, endRow);
+    }
+
+    @Override
+    protected boolean isCancelled(FateId fateId, ServerContext context)
+        throws InterruptedException, KeeperException {
+      return false;
+    }
+
+  }
+
   @Test
   public void testCancelId() throws Exception {
 
     final InstanceId instance = InstanceId.of(UUID.randomUUID());
-    final long compactId = 123;
-    final long cancelId = 124;
     final NamespaceId namespaceId = NamespaceId.of("13");
     final TableId tableId = TableId.of("42");
+    final FateId compactionFateId = FateId.from(FateInstanceType.USER, UUID.randomUUID());
     final byte[] startRow = new byte[0];
     final byte[] endRow = new byte[0];
 
@@ -57,17 +93,13 @@ public class CompactionDriverTest {
     EasyMock.expect(manager.getContext()).andReturn(ctx);
     EasyMock.expect(ctx.getZooReaderWriter()).andReturn(zrw);
 
-    final String zCancelID = CompactionDriver.createCompactionCancellationPath(instance, tableId);
-    EasyMock.expect(zrw.getData(zCancelID)).andReturn(Long.toString(cancelId).getBytes());
-
     EasyMock.replay(manager, ctx, zrw);
 
-    final CompactionDriver driver =
-        new CompactionDriver(compactId, namespaceId, tableId, startRow, endRow);
-    final long tableIdLong = Long.parseLong(tableId.toString());
+    final CancelledCompactionDriver driver =
+        new CancelledCompactionDriver(namespaceId, tableId, startRow, endRow);
 
     var e = assertThrows(AcceptableThriftTableOperationException.class,
-        () -> driver.isReady(tableIdLong, manager));
+        () -> driver.isReady(compactionFateId, manager));
 
     assertEquals(e.getTableId(), tableId.toString());
     assertEquals(e.getOp(), TableOperation.COMPACT);
@@ -81,10 +113,9 @@ public class CompactionDriverTest {
   public void testTableBeingDeleted() throws Exception {
 
     final InstanceId instance = InstanceId.of(UUID.randomUUID());
-    final long compactId = 123;
-    final long cancelId = 122;
     final NamespaceId namespaceId = NamespaceId.of("14");
     final TableId tableId = TableId.of("43");
+    final FateId compactionFateId = FateId.from(FateInstanceType.USER, UUID.randomUUID());
     final byte[] startRow = new byte[0];
     final byte[] endRow = new byte[0];
 
@@ -95,20 +126,16 @@ public class CompactionDriverTest {
     EasyMock.expect(manager.getContext()).andReturn(ctx);
     EasyMock.expect(ctx.getZooReaderWriter()).andReturn(zrw);
 
-    final String zCancelID = CompactionDriver.createCompactionCancellationPath(instance, tableId);
-    EasyMock.expect(zrw.getData(zCancelID)).andReturn(Long.toString(cancelId).getBytes());
-
     String deleteMarkerPath = PreDeleteTable.createDeleteMarkerPath(instance, tableId);
     EasyMock.expect(zrw.exists(deleteMarkerPath)).andReturn(true);
 
     EasyMock.replay(manager, ctx, zrw);
 
-    final CompactionDriver driver =
-        new CompactionDriver(compactId, namespaceId, tableId, startRow, endRow);
-    final long tableIdLong = Long.parseLong(tableId.toString());
+    final NotCancelledCompactionDriver driver =
+        new NotCancelledCompactionDriver(namespaceId, tableId, startRow, endRow);
 
     var e = assertThrows(AcceptableThriftTableOperationException.class,
-        () -> driver.isReady(tableIdLong, manager));
+        () -> driver.isReady(compactionFateId, manager));
 
     assertEquals(e.getTableId(), tableId.toString());
     assertEquals(e.getOp(), TableOperation.COMPACT);

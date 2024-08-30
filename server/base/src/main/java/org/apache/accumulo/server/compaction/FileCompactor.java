@@ -18,6 +18,8 @@
  */
 package org.apache.accumulo.server.compaction;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
 import java.io.IOException;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
@@ -67,8 +69,7 @@ import org.apache.accumulo.core.tabletserver.thrift.TCompactionReason;
 import org.apache.accumulo.core.trace.TraceUtil;
 import org.apache.accumulo.core.util.LocalityGroupUtil;
 import org.apache.accumulo.core.util.LocalityGroupUtil.LocalityGroupConfigurationError;
-import org.apache.accumulo.core.util.ratelimit.RateLimiter;
-import org.apache.accumulo.core.util.time.NanoTime;
+import org.apache.accumulo.core.util.Timer;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.accumulo.server.iterators.SystemIteratorEnvironment;
@@ -100,10 +101,6 @@ public class FileCompactor implements Callable<CompactionStats> {
 
     IteratorScope getIteratorScope();
 
-    RateLimiter getReadLimiter();
-
-    RateLimiter getWriteLimiter();
-
     SystemIteratorEnvironment createIteratorEnv(ServerContext context,
         AccumuloConfiguration acuTableConf, TableId tableId);
 
@@ -125,7 +122,7 @@ public class FileCompactor implements Callable<CompactionStats> {
 
   // things to report
   private String currentLocalityGroup = "";
-  private volatile NanoTime startTime;
+  private volatile Timer startTime;
 
   private final AtomicInteger timesPaused = new AtomicInteger(0);
 
@@ -140,7 +137,7 @@ public class FileCompactor implements Callable<CompactionStats> {
 
   private static final LongAdder totalEntriesRead = new LongAdder();
   private static final LongAdder totalEntriesWritten = new LongAdder();
-  private static volatile NanoTime lastUpdateTime = NanoTime.now();
+  private static final Timer lastUpdateTime = Timer.startNew();
 
   private final DateFormat dateFormatter = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss.SSS");
 
@@ -217,11 +214,11 @@ public class FileCompactor implements Callable<CompactionStats> {
    * is rate limited, so it will not cause issues if called too frequently.
    */
   private static void updateTotalEntries() {
-    if (lastUpdateTime.elapsed().compareTo(Duration.ofMillis(100)) < 0) {
+    if (!lastUpdateTime.hasElapsed(100, MILLISECONDS)) {
       return;
     }
     runningCompactions.forEach(FileCompactor::updateGlobalEntryCounts);
-    lastUpdateTime = NanoTime.now();
+    lastUpdateTime.restart();
   }
 
   protected static final Set<FileCompactor> runningCompactions =
@@ -284,7 +281,7 @@ public class FileCompactor implements Callable<CompactionStats> {
 
     CompactionStats majCStats = new CompactionStats();
 
-    startTime = NanoTime.now();
+    startTime = Timer.startNew();
 
     boolean remove = runningCompactions.add(this);
 
@@ -311,7 +308,7 @@ public class FileCompactor implements Callable<CompactionStats> {
 
       WriterBuilder outBuilder =
           fileFactory.newWriterBuilder().forFile(outputFile, ns, ns.getConf(), cryptoService)
-              .withTableConfiguration(acuTableConf).withRateLimiter(env.getWriteLimiter());
+              .withTableConfiguration(acuTableConf);
       if (dropCacheBehindOutput) {
         outBuilder.dropCachesBehind();
       }
@@ -431,8 +428,7 @@ public class FileCompactor implements Callable<CompactionStats> {
         FileSKVIterator reader;
 
         reader = fileFactory.newReaderBuilder().forFile(dataFile, fs, fs.getConf(), cryptoService)
-            .withTableConfiguration(acuTableConf).withRateLimiter(env.getReadLimiter())
-            .dropCachesBehind().build();
+            .withTableConfiguration(acuTableConf).dropCachesBehind().build();
 
         readers.add(reader);
 

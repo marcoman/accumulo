@@ -38,7 +38,6 @@ import org.apache.accumulo.core.data.Range;
 import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.security.Authorizations;
-import org.apache.accumulo.core.spi.scan.ScanServerSelector;
 import org.apache.accumulo.harness.MiniClusterConfigurationCallback;
 import org.apache.accumulo.harness.SharedMiniClusterBase;
 import org.apache.accumulo.minicluster.ServerType;
@@ -57,7 +56,8 @@ public class ScanServerShutdownIT extends SharedMiniClusterBase {
     @Override
     public void configureMiniCluster(MiniAccumuloConfigImpl cfg,
         org.apache.hadoop.conf.Configuration coreSite) {
-      cfg.setNumScanServers(1);
+
+      cfg.getClusterServerConfiguration().setNumDefaultScanServers(1);
 
       // Timeout scan sessions after being idle for 3 seconds
       cfg.setProperty(Property.TSERV_SESSION_MAXIDLE, "3s");
@@ -65,6 +65,9 @@ public class ScanServerShutdownIT extends SharedMiniClusterBase {
       // Configure the scan server to only have 1 scan executor thread. This means
       // that the scan server will run scans serially, not concurrently.
       cfg.setProperty(Property.SSERV_SCAN_EXECUTORS_DEFAULT_THREADS, "1");
+
+      // Set our custom implementation that shuts down after 3 batch scans
+      cfg.setServerClass(ServerType.SCAN_SERVER, SelfStoppingScanServer.class);
     }
   }
 
@@ -86,13 +89,6 @@ public class ScanServerShutdownIT extends SharedMiniClusterBase {
     String zooRoot = ctx.getZooKeeperRoot();
     ZooReaderWriter zrw = ctx.getZooReaderWriter();
     String scanServerRoot = zooRoot + Constants.ZSSERVERS;
-
-    Wait.waitFor(() -> zrw.getChildren(scanServerRoot).size() == 0);
-
-    // Stop normal ScanServers so that we can start our custom implementation
-    // that shuts down after 3 batch scans
-    getCluster().getClusterControl().startScanServer(SelfStoppingScanServer.class, 1,
-        ScanServerSelector.DEFAULT_SCAN_SERVER_GROUP_NAME);
 
     // Wait for the ScanServer to register in ZK
     Wait.waitFor(() -> zrw.getChildren(scanServerRoot).size() == 1);

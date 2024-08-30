@@ -66,6 +66,8 @@ enum FateOperation {
   NAMESPACE_DELETE
   NAMESPACE_RENAME
   TABLE_BULK_IMPORT2
+  TABLE_TABLET_AVAILABILITY
+  TABLE_SPLIT
 }
 
 enum ManagerState {
@@ -99,7 +101,6 @@ struct TableInfo {
   7:double queryRate
   8:double queryByteRate
   9:Compacting minors
-  10:Compacting majors
   11:Compacting scans
   12:double scanRate
 }
@@ -147,7 +148,6 @@ struct TabletServerStatus {
   14:list<RecoveryStatus> logSorts
   15:i64 flushs
   16:i64 syncs
-  17:list<BulkImportStatus> bulkImports
   19:string version
   18:i64 responseTime
 }
@@ -164,12 +164,23 @@ struct ManagerMonitorInfo {
   9:list<BulkImportStatus> bulkImports
 }
 
+enum TFateInstanceType {
+  META
+  USER
+}
+
+struct TFateId {
+  1:TFateInstanceType type
+  2:string txUUIDStr
+}
+
 service FateService {
 
   // register a fate operation by reserving an opid
-  i64 beginFateOperation(
+  TFateId beginFateOperation(
     1:client.TInfo tinfo
     2:security.TCredentials credentials
+    3:TFateInstanceType type
   ) throws (
     1:client.ThriftSecurityException sec
     2:client.ThriftNotActiveServiceException tnase
@@ -179,7 +190,7 @@ service FateService {
   void executeFateOperation(
     1:client.TInfo tinfo
     2:security.TCredentials credentials
-    3:i64 opid
+    3:TFateId opid
     4:FateOperation op
     5:list<binary> arguments
     6:map<string, string> options
@@ -194,7 +205,7 @@ service FateService {
   string waitForFateOperation(
     1:client.TInfo tinfo
     2:security.TCredentials credentials
-    3:i64 opid
+    3:TFateId opid
   ) throws (
     1:client.ThriftSecurityException sec
     2:client.ThriftTableOperationException tope
@@ -205,7 +216,7 @@ service FateService {
   void finishFateOperation(
     1:client.TInfo tinfo
     2:security.TCredentials credentials
-    3:i64 opid
+    3:TFateId opid
   ) throws (
     1:client.ThriftSecurityException sec
     2:client.ThriftNotActiveServiceException tnase
@@ -215,7 +226,7 @@ service FateService {
   bool cancelFateOperation(
     1:client.TInfo tinfo
     2:security.TCredentials credentials
-    3:i64 opid
+    3:TFateId opid
   ) throws (
     1:client.ThriftSecurityException sec
     2:client.ThriftNotActiveServiceException tnase
@@ -398,14 +409,6 @@ service ManagerClientService {
     1:client.ThriftNotActiveServiceException tnase
   )
 
-  // tablet server reporting
-  oneway void reportSplitExtent(
-    1:client.TInfo tinfo
-    2:security.TCredentials credentials
-    3:string serverName
-    4:TabletSplit split
-  )
-
   oneway void reportTabletStatus(
     1:client.TInfo tinfo
     2:security.TCredentials credentials
@@ -432,4 +435,13 @@ service ManagerClientService {
     2:client.ThriftNotActiveServiceException tnase
   )
 
+  void requestTabletHosting(
+    1:client.TInfo tinfo
+    2:security.TCredentials credentials
+    3:string tableId
+    4:list<data.TKeyExtent> extents
+  ) throws (
+    1:client.ThriftSecurityException sec
+    2:client.ThriftTableOperationException toe
+  )
 }

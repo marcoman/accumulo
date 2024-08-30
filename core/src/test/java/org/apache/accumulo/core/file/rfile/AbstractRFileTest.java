@@ -18,6 +18,7 @@
  */
 package org.apache.accumulo.core.file.rfile;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
@@ -106,7 +107,7 @@ public abstract class AbstractRFileTest {
       CryptoService cs = CryptoFactoryLoader.getServiceForClient(CryptoEnvironment.Scope.TABLE,
           accumuloConfiguration.getAllCryptoProperties());
 
-      BCFile.Writer _cbw = new BCFile.Writer(dos, null, "gz", conf, cs);
+      BCFile.Writer _cbw = new BCFile.Writer(dos, "gz", conf, cs);
 
       SamplerConfigurationImpl samplerConfig =
           SamplerConfigurationImpl.newSamplerConfig(accumuloConfiguration);
@@ -237,7 +238,8 @@ public abstract class AbstractRFileTest {
   }
 
   static Key newKey(String row, String cf, String cq, String cv, long ts) {
-    return new Key(row.getBytes(), cf.getBytes(), cq.getBytes(), cv.getBytes(), ts);
+    return new Key(row.getBytes(UTF_8), cf.getBytes(UTF_8), cq.getBytes(UTF_8), cv.getBytes(UTF_8),
+        ts);
   }
 
   static Value newValue(String val) {

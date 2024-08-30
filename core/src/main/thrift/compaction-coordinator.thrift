@@ -49,7 +49,7 @@ struct TCompactionStatusUpdate {
 }
 
 struct TExternalCompaction {
-  1:string queueName
+  1:string groupName
   2:string compactor
   3:map<i64,TCompactionStatusUpdate> updates
   4:tabletserver.TExternalCompactionJob job
@@ -87,7 +87,7 @@ service CompactionCoordinatorService {
   TNextCompactionJob getCompactionJob(
     1:client.TInfo tinfo
     2:security.TCredentials credentials
-    3:string queueName
+    3:string groupName
     4:string compactor
     5:string externalCompactionId
   )

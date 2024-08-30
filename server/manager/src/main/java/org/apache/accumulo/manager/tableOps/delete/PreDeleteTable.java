@@ -23,6 +23,7 @@ import org.apache.accumulo.core.clientImpl.thrift.TableOperation;
 import org.apache.accumulo.core.data.InstanceId;
 import org.apache.accumulo.core.data.NamespaceId;
 import org.apache.accumulo.core.data.TableId;
+import org.apache.accumulo.core.fate.FateId;
 import org.apache.accumulo.core.fate.Repo;
 import org.apache.accumulo.core.fate.zookeeper.DistributedReadWriteLock.LockType;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
@@ -30,7 +31,7 @@ import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeExistsPolicy;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.ManagerRepo;
 import org.apache.accumulo.manager.tableOps.Utils;
-import org.apache.accumulo.manager.tableOps.compact.cancel.CancelCompactions;
+import org.apache.accumulo.server.compaction.CompactionConfigStorage;
 import org.apache.zookeeper.KeeperException;
 
 public class PreDeleteTable extends ManagerRepo {
@@ -42,8 +43,8 @@ public class PreDeleteTable extends ManagerRepo {
 
   private static final long serialVersionUID = 1L;
 
-  private TableId tableId;
-  private NamespaceId namespaceId;
+  private final TableId tableId;
+  private final NamespaceId namespaceId;
 
   public PreDeleteTable(NamespaceId namespaceId, TableId tableId) {
     this.tableId = tableId;
@@ -51,9 +52,10 @@ public class PreDeleteTable extends ManagerRepo {
   }
 
   @Override
-  public long isReady(long tid, Manager env) throws Exception {
-    return Utils.reserveNamespace(env, namespaceId, tid, LockType.READ, true, TableOperation.DELETE)
-        + Utils.reserveTable(env, tableId, tid, LockType.READ, true, TableOperation.DELETE);
+  public long isReady(FateId fateId, Manager env) throws Exception {
+    return Utils.reserveNamespace(env, namespaceId, fateId, LockType.READ, true,
+        TableOperation.DELETE)
+        + Utils.reserveTable(env, tableId, fateId, LockType.READ, true, TableOperation.DELETE);
   }
 
   private void preventFutureCompactions(Manager environment)
@@ -64,21 +66,27 @@ public class PreDeleteTable extends ManagerRepo {
   }
 
   @Override
-  public Repo<Manager> call(long tid, Manager environment) throws Exception {
+  public Repo<Manager> call(FateId fateId, Manager environment) throws Exception {
     try {
       preventFutureCompactions(environment);
-      CancelCompactions.mutateZooKeeper(tid, tableId, environment);
+
+      var idsToCancel =
+          CompactionConfigStorage.getAllConfig(environment.getContext(), tableId::equals).keySet();
+
+      for (var idToCancel : idsToCancel) {
+        CompactionConfigStorage.deleteConfig(environment.getContext(), idToCancel);
+      }
       return new DeleteTable(namespaceId, tableId);
     } finally {
-      Utils.unreserveTable(environment, tableId, tid, LockType.READ);
-      Utils.unreserveNamespace(environment, namespaceId, tid, LockType.READ);
+      Utils.unreserveTable(environment, tableId, fateId, LockType.READ);
+      Utils.unreserveNamespace(environment, namespaceId, fateId, LockType.READ);
     }
   }
 
   @Override
-  public void undo(long tid, Manager env) {
-    Utils.unreserveTable(env, tableId, tid, LockType.READ);
-    Utils.unreserveNamespace(env, namespaceId, tid, LockType.READ);
+  public void undo(FateId fateId, Manager env) {
+    Utils.unreserveTable(env, tableId, fateId, LockType.READ);
+    Utils.unreserveNamespace(env, namespaceId, fateId, LockType.READ);
   }
 
 }

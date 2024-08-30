@@ -22,20 +22,14 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.SortedSet;
+import java.util.TreeSet;
 import java.util.stream.Stream;
 
-import org.apache.accumulo.core.client.BatchWriter;
-import org.apache.accumulo.core.client.MutationsRejectedException;
-import org.apache.accumulo.core.client.admin.TimeType;
-import org.apache.accumulo.core.data.Mutation;
-import org.apache.accumulo.core.data.TableId;
-import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
+import org.apache.accumulo.core.fate.FateId;
 import org.apache.accumulo.core.fate.Repo;
 import org.apache.accumulo.core.lock.ServiceLock;
-import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection.ServerColumnFamily;
-import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection.TabletColumnFamily;
 import org.apache.accumulo.core.metadata.schema.MetadataTime;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.ManagerRepo;
@@ -58,50 +52,55 @@ class PopulateMetadata extends ManagerRepo {
   }
 
   @Override
-  public long isReady(long tid, Manager environment) {
+  public long isReady(FateId fateId, Manager environment) {
     return 0;
   }
 
   @Override
-  public Repo<Manager> call(long tid, Manager env) throws Exception {
-    KeyExtent extent = new KeyExtent(tableInfo.getTableId(), null, null);
-    MetadataTableUtil.addTablet(extent, ServerColumnFamily.DEFAULT_TABLET_DIR_NAME,
-        env.getContext(), tableInfo.getTimeType(), env.getManagerLock());
+  public Repo<Manager> call(FateId fateId, Manager env) throws Exception {
+    SortedSet<Text> splits;
+    Map<Text,Text> splitDirMap;
 
     if (tableInfo.getInitialSplitSize() > 0) {
-      SortedSet<Text> splits = Utils.getSortedSetFromFile(env, tableInfo.getSplitPath(), true);
+      splits = Utils.getSortedSetFromFile(env, tableInfo.getSplitPath(), true);
       SortedSet<Text> dirs = Utils.getSortedSetFromFile(env, tableInfo.getSplitDirsPath(), false);
-      Map<Text,Text> splitDirMap = createSplitDirectoryMap(splits, dirs);
-      try (
-          BatchWriter bw = env.getContext().createBatchWriter(AccumuloTable.METADATA.tableName())) {
-        writeSplitsToMetadataTable(env.getContext(), tableInfo.getTableId(), splits, splitDirMap,
-            tableInfo.getTimeType(), env.getManagerLock(), bw);
-      }
+      splitDirMap = createSplitDirectoryMap(splits, dirs);
+    } else {
+      splits = new TreeSet<>();
+      splitDirMap = Map.of();
     }
+
+    writeSplitsToMetadataTable(env.getContext(), splits, splitDirMap, env.getManagerLock());
+
     return new FinishCreateTable(tableInfo);
   }
 
-  private void writeSplitsToMetadataTable(ServerContext context, TableId tableId,
-      SortedSet<Text> splits, Map<Text,Text> data, TimeType timeType, ServiceLock lock,
-      BatchWriter bw) throws MutationsRejectedException {
-    Text prevSplit = null;
-    Value dirValue;
-    Iterable<Text> iter = () -> Stream.concat(splits.stream(), Stream.of((Text) null)).iterator();
-    for (Text split : iter) {
-      Mutation mut =
-          TabletColumnFamily.createPrevRowMutation(new KeyExtent(tableId, split, prevSplit));
-      dirValue = (split == null) ? new Value(ServerColumnFamily.DEFAULT_TABLET_DIR_NAME)
-          : new Value(data.get(split));
-      ServerColumnFamily.DIRECTORY_COLUMN.put(mut, dirValue);
-      ServerColumnFamily.TIME_COLUMN.put(mut, new Value(new MetadataTime(0, timeType).encode()));
-      MetadataTableUtil.putLockID(context, lock, mut);
-      prevSplit = split;
-      bw.addMutation(mut);
+  private void writeSplitsToMetadataTable(ServerContext context, SortedSet<Text> splits,
+      Map<Text,Text> data, ServiceLock lock) {
+    try (var tabletsMutator = context.getAmple().mutateTablets()) {
+      Text prevSplit = null;
+      Iterable<Text> iter = () -> Stream.concat(splits.stream(), Stream.of((Text) null)).iterator();
+      for (Text split : iter) {
+        var extent = new KeyExtent(tableInfo.getTableId(), split, prevSplit);
+
+        var tabletMutator = tabletsMutator.mutateTablet(extent);
+
+        String dirName = (split == null) ? ServerColumnFamily.DEFAULT_TABLET_DIR_NAME
+            : data.get(split).toString();
+
+        tabletMutator.putPrevEndRow(extent.prevEndRow());
+        tabletMutator.putDirName(dirName);
+        tabletMutator.putTime(new MetadataTime(0, tableInfo.getTimeType()));
+        tabletMutator.putTabletAvailability(tableInfo.getInitialTabletAvailability());
+        tabletMutator.mutate();
+
+        prevSplit = split;
+      }
     }
   }
 
   @Override
-  public void undo(long tid, Manager environment) throws Exception {
+  public void undo(FateId fateId, Manager environment) throws Exception {
     MetadataTableUtil.deleteTable(tableInfo.getTableId(), false, environment.getContext(),
         environment.getManagerLock());
   }

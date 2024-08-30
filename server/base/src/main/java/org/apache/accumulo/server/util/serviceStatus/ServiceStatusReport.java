@@ -18,7 +18,7 @@
  */
 package org.apache.accumulo.server.util.serviceStatus;
 
-import static org.apache.accumulo.core.lock.ServiceLockData.ServiceDescriptor.DEFAULT_GROUP_NAME;
+import static org.apache.accumulo.core.Constants.DEFAULT_RESOURCE_GROUP_NAME;
 
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -142,7 +142,7 @@ public class ServiceStatusReport {
     }
     // only default group is present, omit grouping from report
     if (!summary.getResourceGroups().isEmpty()
-        && summary.getResourceGroups().equals(Set.of(DEFAULT_GROUP_NAME))) {
+        && summary.getResourceGroups().equals(Set.of(DEFAULT_RESOURCE_GROUP_NAME))) {
       fmtServiceStatus(sb, reportKey, summary, noHosts);
       return;
     }

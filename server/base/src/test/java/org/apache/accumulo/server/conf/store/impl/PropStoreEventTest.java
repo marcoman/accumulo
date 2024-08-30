@@ -75,6 +75,7 @@ public class PropStoreEventTest {
     expect(zrw.exists(eq("/accumulo/" + instanceId), anyObject())).andReturn(true).anyTimes();
 
     readyMonitor = createMock(ReadyMonitor.class);
+
   }
 
   @AfterEach

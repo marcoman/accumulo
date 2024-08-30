@@ -18,6 +18,10 @@
  */
 package org.apache.accumulo.core.util.compaction;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.apache.accumulo.core.util.threads.ThreadPoolNames.COMPACTOR_RUNNING_COMPACTIONS_POOL;
+import static org.apache.accumulo.core.util.threads.ThreadPoolNames.COMPACTOR_RUNNING_COMPACTION_IDS_POOL;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -29,7 +33,6 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.clientImpl.ClientContext;
@@ -45,6 +48,7 @@ import org.apache.accumulo.core.rpc.clients.ThriftClientTypes;
 import org.apache.accumulo.core.tabletserver.thrift.ActiveCompaction;
 import org.apache.accumulo.core.tabletserver.thrift.TExternalCompactionJob;
 import org.apache.accumulo.core.trace.TraceUtil;
+import org.apache.accumulo.core.util.Timer;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.thrift.TException;
 import org.apache.zookeeper.KeeperException;
@@ -57,19 +61,19 @@ import com.google.common.net.HostAndPort;
 public class ExternalCompactionUtil {
 
   private static class RunningCompactionFuture {
-    private final String queue;
+    private final String group;
     private final HostAndPort compactor;
     private final Future<TExternalCompactionJob> future;
 
-    public RunningCompactionFuture(String queue, HostAndPort compactor,
+    public RunningCompactionFuture(String group, HostAndPort compactor,
         Future<TExternalCompactionJob> future) {
-      this.queue = queue;
+      this.group = group;
       this.compactor = compactor;
       this.future = future;
     }
 
-    public String getQueue() {
-      return queue;
+    public String getGroup() {
+      return group;
     }
 
     public HostAndPort getCompactor() {
@@ -101,32 +105,32 @@ public class ExternalCompactionUtil {
    * @return Optional HostAndPort of Coordinator node if found
    */
   public static Optional<HostAndPort> findCompactionCoordinator(ClientContext context) {
-    final String lockPath = context.getZooKeeperRoot() + Constants.ZCOORDINATOR_LOCK;
+    final String lockPath = context.getZooKeeperRoot() + Constants.ZMANAGER_LOCK;
     return ServiceLock.getLockData(context.getZooCache(), ServiceLock.path(lockPath), new ZcStat())
         .map(sld -> sld.getAddress(ThriftService.COORDINATOR));
   }
 
   /**
-   * @return map of queue names to compactor addresses
+   * @return map of group names to compactor addresses
    */
   public static Map<String,Set<HostAndPort>> getCompactorAddrs(ClientContext context) {
     try {
-      final Map<String,Set<HostAndPort>> queuesAndAddresses = new HashMap<>();
-      final String compactorQueuesPath = context.getZooKeeperRoot() + Constants.ZCOMPACTORS;
+      final Map<String,Set<HostAndPort>> groupsAndAddresses = new HashMap<>();
+      final String compactorGroupsPath = context.getZooKeeperRoot() + Constants.ZCOMPACTORS;
       ZooReader zooReader = context.getZooReader();
-      List<String> queues = zooReader.getChildren(compactorQueuesPath);
-      for (String queue : queues) {
-        queuesAndAddresses.putIfAbsent(queue, new HashSet<>());
+      List<String> groups = zooReader.getChildren(compactorGroupsPath);
+      for (String group : groups) {
         try {
-          List<String> compactors = zooReader.getChildren(compactorQueuesPath + "/" + queue);
+          List<String> compactors = zooReader.getChildren(compactorGroupsPath + "/" + group);
           for (String compactor : compactors) {
             // compactor is the address, we are checking to see if there is a child node which
             // represents the compactor's lock as a check that it's alive.
             List<String> children =
-                zooReader.getChildren(compactorQueuesPath + "/" + queue + "/" + compactor);
+                zooReader.getChildren(compactorGroupsPath + "/" + group + "/" + compactor);
             if (!children.isEmpty()) {
               LOG.trace("Found live compactor {} ", compactor);
-              queuesAndAddresses.get(queue).add(HostAndPort.fromString(compactor));
+              groupsAndAddresses.putIfAbsent(group, new HashSet<>());
+              groupsAndAddresses.get(group).add(HostAndPort.fromString(compactor));
             }
           }
         } catch (NoNodeException e) {
@@ -134,7 +138,7 @@ public class ExternalCompactionUtil {
         }
       }
 
-      return queuesAndAddresses;
+      return groupsAndAddresses;
     } catch (KeeperException e) {
       throw new IllegalStateException(e);
     } catch (InterruptedException e) {
@@ -221,10 +225,11 @@ public class ExternalCompactionUtil {
   public static List<RunningCompaction> getCompactionsRunningOnCompactors(ClientContext context) {
     final List<RunningCompactionFuture> rcFutures = new ArrayList<>();
     final ExecutorService executor = ThreadPools.getServerThreadPools()
-        .getPoolBuilder("CompactorRunningCompactions").numCoreThreads(16).build();
-    getCompactorAddrs(context).forEach((q, hp) -> {
+        .getPoolBuilder(COMPACTOR_RUNNING_COMPACTIONS_POOL).numCoreThreads(16).build();
+
+    getCompactorAddrs(context).forEach((group, hp) -> {
       hp.forEach(hostAndPort -> {
-        rcFutures.add(new RunningCompactionFuture(q, hostAndPort,
+        rcFutures.add(new RunningCompactionFuture(group, hostAndPort,
             executor.submit(() -> getRunningCompaction(hostAndPort, context))));
       });
     });
@@ -236,7 +241,7 @@ public class ExternalCompactionUtil {
         TExternalCompactionJob job = rcf.getFuture().get();
         if (null != job && null != job.getExternalCompactionId()) {
           var compactorAddress = getHostPortString(rcf.getCompactor());
-          results.add(new RunningCompaction(job, compactorAddress, rcf.getQueue()));
+          results.add(new RunningCompaction(job, compactorAddress, rcf.getGroup()));
         }
       } catch (InterruptedException | ExecutionException e) {
         throw new IllegalStateException(e);
@@ -248,7 +253,7 @@ public class ExternalCompactionUtil {
   public static Collection<ExternalCompactionId>
       getCompactionIdsRunningOnCompactors(ClientContext context) {
     final ExecutorService executor = ThreadPools.getServerThreadPools()
-        .getPoolBuilder("CompactorRunningCompactions").numCoreThreads(16).build();
+        .getPoolBuilder(COMPACTOR_RUNNING_COMPACTION_IDS_POOL).numCoreThreads(16).build();
     List<Future<ExternalCompactionId>> futures = new ArrayList<>();
 
     getCompactorAddrs(context).forEach((q, hp) -> {
@@ -274,10 +279,10 @@ public class ExternalCompactionUtil {
     return runningIds;
   }
 
-  public static int countCompactors(String queueName, ClientContext context) {
-    long start = System.nanoTime();
-    String queueRoot = context.getZooKeeperRoot() + Constants.ZCOMPACTORS + "/" + queueName;
-    List<String> children = context.getZooCache().getChildren(queueRoot);
+  public static int countCompactors(String groupName, ClientContext context) {
+    var start = Timer.startNew();
+    String groupRoot = context.getZooKeeperRoot() + Constants.ZCOMPACTORS + "/" + groupName;
+    List<String> children = context.getZooCache().getChildren(groupRoot);
     if (children == null) {
       return 0;
     }
@@ -285,17 +290,17 @@ public class ExternalCompactionUtil {
     int count = 0;
 
     for (String child : children) {
-      List<String> children2 = context.getZooCache().getChildren(queueRoot + "/" + child);
+      List<String> children2 = context.getZooCache().getChildren(groupRoot + "/" + child);
       if (children2 != null && !children2.isEmpty()) {
         count++;
       }
     }
 
-    long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+    long elapsed = start.elapsed(MILLISECONDS);
     if (elapsed > 100) {
-      LOG.debug("Took {} ms to count {} compactors for {}", elapsed, count, queueName);
+      LOG.debug("Took {} ms to count {} compactors for {}", elapsed, count, groupName);
     } else {
-      LOG.trace("Took {} ms to count {} compactors for {}", elapsed, count, queueName);
+      LOG.trace("Took {} ms to count {} compactors for {}", elapsed, count, groupName);
     }
 
     return count;

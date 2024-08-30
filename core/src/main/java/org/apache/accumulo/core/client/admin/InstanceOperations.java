@@ -90,7 +90,7 @@ public interface InstanceOperations {
    *               var planner = currProps.get("compaction.service.default.planner");
    *               //This code will only change the compaction planner if its currently set to default settings.
    *               //The endsWith() function was used to make the example short, would be better to use equals().
-   *               if(planner != null && planner.endsWith("DefaultCompactionPlanner") {
+   *               if(planner != null && planner.endsWith("RatioBasedCompactionPlanner") {
    *                 // tservers will eventually see these compaction planner changes and when they do they will see all of the changes at once
    *                 currProps.keySet().removeIf(
    *                    prop -> prop.startsWith("compaction.service.default.planner.opts."));
@@ -185,6 +185,14 @@ public interface InstanceOperations {
   List<String> getManagerLocations();
 
   /**
+   * Returns the locations of the active compactors
+   *
+   * @return A set of currently active compactors.
+   * @since 2.1.4
+   */
+  Set<String> getCompactors();
+
+  /**
    * Returns the locations of the active scan servers
    *
    * @return A set of currently active scan servers.
@@ -209,13 +217,12 @@ public interface InstanceOperations {
       throws AccumuloException, AccumuloSecurityException;
 
   /**
-   * List the active compaction running on a tablet server. Using this method with
-   * {@link #getTabletServers()} will only show compactions running on tservers, leaving out any
-   * external compactions running on compactors. Use {@link #getActiveCompactions()} to get a list
-   * of all compactions running on tservers and compactors.
+   * List the active compaction running on a TabletServer or Compactor. The server address can be
+   * retrieved using {@link #getCompactors()} or {@link #getTabletServers()}. Use
+   * {@link #getActiveCompactions()} to get a list of all compactions running on tservers and
+   * compactors. Implementation updated in 2.1.4 to accept a compactor address.
    *
-   * @param tserver The tablet server address. This should be of the form
-   *        {@code <ip address>:<port>}
+   * @param tserver The server address. This should be of the form {@code <ip address>:<port>}
    * @return the list of active compactions
    * @since 1.5.0
    */

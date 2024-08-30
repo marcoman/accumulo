@@ -103,6 +103,25 @@ public class NewTableConfigurationTest {
 
   }
 
+  @Test
+  public void testWithAndGetInitialTabletAvailability() {
+    NewTableConfiguration ntc = new NewTableConfiguration();
+    TabletAvailability initialTabletAvailability = ntc.getInitialTabletAvailability();
+    assertEquals(TabletAvailability.ONDEMAND, initialTabletAvailability);
+
+    ntc = new NewTableConfiguration().withInitialTabletAvailability(TabletAvailability.ONDEMAND);
+    initialTabletAvailability = ntc.getInitialTabletAvailability();
+    assertEquals(TabletAvailability.ONDEMAND, initialTabletAvailability);
+
+    ntc = new NewTableConfiguration().withInitialTabletAvailability(TabletAvailability.HOSTED);
+    initialTabletAvailability = ntc.getInitialTabletAvailability();
+    assertEquals(TabletAvailability.HOSTED, initialTabletAvailability);
+
+    ntc = new NewTableConfiguration().withInitialTabletAvailability(TabletAvailability.UNHOSTED);
+    initialTabletAvailability = ntc.getInitialTabletAvailability();
+    assertEquals(TabletAvailability.UNHOSTED, initialTabletAvailability);
+  }
+
   /**
    * Verify that createOffline option
    */

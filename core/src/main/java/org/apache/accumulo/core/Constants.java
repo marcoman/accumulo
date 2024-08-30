@@ -43,8 +43,7 @@ public class Constants {
   public static final String ZTABLE_DELETE_MARKER = "/deleting";
   public static final String ZTABLE_STATE = "/state";
   public static final String ZTABLE_FLUSH_ID = "/flush-id";
-  public static final String ZTABLE_COMPACT_ID = "/compact-id";
-  public static final String ZTABLE_COMPACT_CANCEL_ID = "/compact-cancel-id";
+
   public static final String ZTABLE_NAMESPACE = "/namespace";
 
   public static final String ZNAMESPACES = "/namespaces";
@@ -62,27 +61,21 @@ public class Constants {
   public static final String ZMONITOR_LOCK = ZMONITOR + "/lock";
   public static final String ZMONITOR_HTTP_ADDR = ZMONITOR + "/http_addr";
 
-  // used by < 2.1 table and namespace configurations
-  public static final String ZCONF_LEGACY = "/conf";
   public static final String ZCONFIG = "/config";
 
   public static final String ZTSERVERS = "/tservers";
 
   public static final String ZSSERVERS = "/sservers";
 
-  public static final String ZCOMPACTORS = "/compactors";
+  // tracks config for running compactions
+  public static final String ZCOMPACTIONS = "/compactions";
 
-  public static final String ZCOORDINATOR = "/coordinators";
-  public static final String ZCOORDINATOR_LOCK = ZCOORDINATOR + "/lock";
+  public static final String ZCOMPACTORS = "/compactors";
 
   public static final String ZDEAD = "/dead";
   public static final String ZDEADTSERVERS = ZDEAD + "/tservers";
 
-  public static final String ZTRACERS = "/tracers";
-
   public static final String ZPROBLEMS = "/problems";
-
-  public static final String BULK_ARBITRATOR_TYPE = "bulkTx";
 
   public static final String ZFATE = "/fate";
 
@@ -125,5 +118,7 @@ public class Constants {
   public static final String HDFS_TABLES_DIR = "/tables";
 
   public static final int DEFAULT_VISIBILITY_CACHE_SIZE = 1000;
+
+  public static final String DEFAULT_RESOURCE_GROUP_NAME = "default";
   public static final String DEFAULT_COMPACTION_SERVICE_NAME = "default";
 }
